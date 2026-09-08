@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Instagram Safety Monitor</title>
+    <style>
+      :root { color-scheme:dark; --bg:#0f172a; --card:#1b2336; --muted:#b0bdd0; --line:#52627a; --text:#f8fafc; --green:#22c55e; --blue:#38bdf8; --red:#f87171; }
+      * { box-sizing:border-box; }
+      body { margin:0; background:radial-gradient(circle at top right,#1e3a5f,var(--bg) 42%); color:var(--text); font:16px/1.5 system-ui,sans-serif; min-height:100vh; }
+      main { width:min(1100px,calc(100% - 32px)); margin:auto; padding:40px 0; }
+      header { display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:24px; }
+      .account-controls { display:flex; flex-wrap:wrap; justify-content:flex-end; align-items:center; gap:8px; }
+      h1 { margin:0 0 4px; font-size:clamp(1.6rem,4vw,2.4rem); }
+      h2 { margin:0; }
+      p { margin:0; color:var(--muted); }
+      .status { display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid var(--line); border-radius:999px; padding:10px 14px; white-space:nowrap; }
+      .dot { width:10px; height:10px; border-radius:50%; background:var(--green); box-shadow:0 0 12px var(--green); }
+      .offline .dot { background:#ef4444; box-shadow:none; }
+      .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; margin-bottom:20px; }
+      .card { background:rgba(27,35,54,.96); border:1px solid var(--line); border-radius:16px; padding:20px; }
+      .number { display:block; font-size:2rem; font-weight:700; }
+      .label { color:var(--muted); }
+      .alert-banner { margin-bottom:20px; border:2px solid var(--red); background:#450a0a; color:#fff; }
+      .toolbar { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:12px; }
+      .filters { display:flex; flex-wrap:wrap; gap:8px; }
+      button { min-height:44px; border:1px solid var(--line); border-radius:10px; padding:0 16px; color:var(--text); background:var(--card); cursor:pointer; font:inherit; transition:background .2s,border-color .2s; }
+      button:hover { border-color:var(--blue); }
+      button:focus-visible { border-color:var(--blue); outline:2px solid var(--blue); outline-offset:2px; }
+      button[aria-pressed="true"] { background:#075985; border-color:var(--blue); }
+      button:disabled { cursor:wait; opacity:.6; }
+      .account-name { color:var(--muted); }
+      dialog { width:min(440px,calc(100% - 32px)); border:1px solid var(--line); border-radius:18px; padding:0; color:var(--text); background:var(--card); box-shadow:0 24px 80px #020617; }
+      dialog::backdrop { background:rgba(2,6,23,.82); }
+      form { display:grid; gap:16px; padding:28px; }
+      form h2 { font-size:1.5rem; }
+      label { display:grid; gap:6px; font-weight:650; }
+      input { width:100%; min-height:48px; border:1px solid var(--line); border-radius:10px; padding:10px 12px; color:var(--text); background:var(--bg); font:inherit; }
+      input:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+      .form-error { border-left:4px solid var(--red); padding:10px 12px; color:#fecaca; background:#450a0a; }
+      .form-actions { display:flex; justify-content:flex-end; gap:8px; }
+      #events { display:grid; gap:10px; }
+      .event { display:grid; grid-template-columns:150px 1fr auto; gap:16px; align-items:start; }
+      .event.alert { border:2px solid var(--red); background:#351b27; }
+      .badge { width:max-content; border-radius:999px; padding:4px 9px; color:#082f49; background:var(--blue); font-size:.8rem; font-weight:700; text-transform:uppercase; }
+      .badge.dm { color:#052e16; background:var(--green); }
+      .badge.image,.badge.video,.badge.audio { color:#2e1065; background:#c4b5fd; }
+      .badge.alert { color:#450a0a; background:var(--red); }
+      .message { overflow-wrap:anywhere; white-space:pre-wrap; }
+      .analysis { margin-top:8px; color:var(--muted); font-weight:650; }
+      .alert .analysis { color:#fecaca; }
+      time,.empty { color:var(--muted); font-size:.9rem; }
+      .empty { text-align:center; padding:48px 20px; }
+      @media (max-width:800px) { .stats { grid-template-columns:repeat(2,1fr); } }
+      @media (max-width:650px) { header,.toolbar { align-items:stretch; flex-direction:column; } .account-controls { justify-content:flex-start; } .stats { grid-template-columns:1fr; } .event { grid-template-columns:1fr; } }
+      @media (prefers-reduced-motion:reduce) { * { transition:none!important; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><h1>Instagram Safety Monitor</h1><p>Azure checks text/images, Sarvam transcribes audio, and Gemini analyzes one-minute videos</p></div>
+        <div class="account-controls"><span id="account-name" class="account-name"></span><button id="change-account" type="button">Change account</button><div id="status" class="status" role="status"><span class="dot" aria-hidden="true"></span><span>Connecting</span></div></div>
+      </header>
+      <dialog id="login-dialog" aria-labelledby="login-title">
+        <form id="login-form">
+          <div><h2 id="login-title">Sign in to Instagram</h2><p>Verify and switch the account monitored by this device.</p></div>
+          <div id="login-error" class="form-error" role="alert" tabindex="-1" hidden></div>
+          <label for="username">Instagram username<input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="30" required /></label>
+          <label for="password">Instagram password<input id="password" name="password" type="password" autocomplete="current-password" maxlength="200" required /></label>
+          <div class="form-actions"><button id="cancel-login" type="button">Cancel</button><button id="login-button" type="submit">Sign in and monitor</button></div>
+        </form>
+      </dialog>
+      <div id="alert-banner" class="card alert-banner" role="alert" hidden><strong>Bullying detected.</strong> Review the red activity below.</div>
+      <section class="stats" aria-label="Activity summary">
+        <div class="card"><span id="total" class="number">0</span><span class="label">Total captured</span></div>
+        <div class="card"><span id="comments" class="number">0</span><span class="label">Comments</span></div>
+        <div class="card"><span id="dms" class="number">0</span><span class="label">Direct messages</span></div>
+        <div class="card"><span id="alerts" class="number">0</span><span class="label">Bullying alerts</span></div>
+      </section>
+      <section aria-labelledby="activity-heading">
+        <div class="toolbar"><div><h2 id="activity-heading">Recent activity</h2><p>Refreshes automatically every five seconds</p></div>
+          <div class="filters" aria-label="Filter activity">
+            <button data-filter="all" aria-pressed="true">All</button><button data-filter="alert" aria-pressed="false">Alerts</button><button data-filter="comment" aria-pressed="false">Comments</button><button data-filter="dm" aria-pressed="false">Messages</button><button data-filter="media" aria-pressed="false">Media</button>
+          </div>
+        </div>
+        <div id="events"><div class="card empty">Waiting for new activity…</div></div>
+      </section>
+    </main>
+    <script>
+      let events=[], filter='all', lastAlerts=0, currentUsername='';
+      const total=document.querySelector('#total'), comments=document.querySelector('#comments'), dms=document.querySelector('#dms'), alerts=document.querySelector('#alerts'), alertBanner=document.querySelector('#alert-banner'), status=document.querySelector('#status'), eventList=document.querySelector('#events'), accountName=document.querySelector('#account-name'), loginDialog=document.querySelector('#login-dialog'), loginForm=document.querySelector('#login-form'), loginError=document.querySelector('#login-error'), loginButton=document.querySelector('#login-button'), cancelLogin=document.querySelector('#cancel-login');
+      function render(){
+        const alertCount=events.filter(e=>e.analysis?.bullying).length;
+        total.textContent=events.length; comments.textContent=events.filter(e=>e.kind==='comment').length; dms.textContent=events.filter(e=>e.kind==='dm').length; alerts.textContent=alertCount;
+        if(alertCount>lastAlerts){ alertBanner.hidden=false; setTimeout(()=>alertBanner.hidden=true,10000); } lastAlerts=alertCount;
+        const shown=events.filter(e=>filter==='all'||(filter==='alert'&&e.analysis?.bullying)||(filter==='media'&&['image','video','audio'].includes(e.kind))||e.kind===filter); eventList.replaceChildren();
+        if(!shown.length){ const empty=document.createElement('div'); empty.className='card empty'; empty.textContent='No matching activity yet.'; eventList.append(empty); return; }
+        for(const event of shown){
+          const flagged=event.analysis?.bullying, row=document.createElement('article'), badge=document.createElement('span'), body=document.createElement('div'), source=document.createElement('strong'), message=document.createElement('div'), time=document.createElement('time');
+          row.className=`card event${flagged?' alert':''}`; badge.className=`badge ${flagged?'alert':event.kind}`; badge.textContent=flagged?'Bullying detected':event.kind==='dm'?'Message':event.kind[0].toUpperCase()+event.kind.slice(1);
+          source.textContent=event.source; message.className='message'; message.textContent=event.text; body.append(source,message);
+          if(event.analysis){ const analysis=document.createElement('div'); analysis.className='analysis'; analysis.textContent=`${event.analysis.severity} severity · ${Math.round(event.analysis.confidence*100)}% confidence · ${event.analysis.reason}`; body.append(analysis); }
+          time.dateTime=event.time; time.textContent=new Date(event.time).toLocaleString(); row.append(badge,body,time); eventList.append(row);
+        }
+      }
+      async function refresh(){ try { const [eventResponse,statusResponse]=await Promise.all([fetch('/api/events'),fetch('/api/status')]); events=await eventResponse.json(); const state=await statusResponse.json(); currentUsername=state.username; accountName.textContent=currentUsername?`Signed in as @${currentUsername}`:'No account signed in'; status.classList.toggle('offline',!state.running); status.lastElementChild.textContent=state.running?'Monitoring live':'Monitor stopped'; render(); } catch { status.classList.add('offline'); status.lastElementChild.textContent='Dashboard disconnected'; } }
+      function openLogin(){ loginError.hidden=true; loginForm.reset(); loginForm.username.value=currentUsername; cancelLogin.hidden=!currentUsername; loginDialog.showModal(); loginForm.username.focus(); }
+      document.querySelector('#change-account').addEventListener('click',openLogin);
+      cancelLogin.addEventListener('click',()=>loginDialog.close());
+      loginDialog.addEventListener('cancel',event=>{ if(!currentUsername) event.preventDefault(); });
+      loginForm.addEventListener('submit',async event=>{ event.preventDefault(); loginError.hidden=true; loginButton.disabled=true; loginButton.textContent='Verifying…'; try { const response=await fetch('/api/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:loginForm.username.value,password:loginForm.password.value})}); const result=await response.json(); if(!response.ok) throw new Error(result.error); currentUsername=result.username; accountName.textContent=`Signed in as @${currentUsername}`; loginDialog.close(); events=[]; lastAlerts=0; await refresh(); } catch(error) { loginError.textContent=error.message||'Sign in failed. Try again.'; loginError.hidden=false; loginError.focus(); } finally { loginButton.disabled=false; loginButton.textContent='Sign in and monitor'; } });
+      document.querySelectorAll('[data-filter]').forEach(button=>button.addEventListener('click',()=>{ filter=button.dataset.filter; document.querySelectorAll('[data-filter]').forEach(item=>item.setAttribute('aria-pressed',item===button)); render(); }));
+      refresh().then(()=>{ if(!currentUsername) openLogin(); }); setInterval(refresh,5000);
+    </script>
+  </body>
+</html>
