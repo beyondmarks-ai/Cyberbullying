@@ -253,7 +253,9 @@ def main():
                     return self.send_html('Configure an HTTPS Instagram redirect URL.', 503)
                 if self.headers.get('Host', '') != redirect.netloc:
                     if self.headers.get('CF-Connecting-IP'):
-                        return self.send_html('Start Instagram login from the local dashboard.', 403)
+                        return self.send_html(
+                            'Open http://127.0.0.1:8765 on the PC running the dashboard, then click Connect Instagram. '
+                            'The public tunnel URL is only for Instagram callbacks and webhooks.', 403)
                     ticket = secrets.token_urlsafe(32)
                     with lock:
                         for key, expiry in list(OAUTH_TICKETS.items()):

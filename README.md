@@ -155,6 +155,11 @@ testing, but its hostname changes when restarted; update `IG_REDIRECT_URI`, `IG_
 the matching Meta settings each time. For a reliable deployment, use a named Cloudflare tunnel or
 host the dashboard behind a permanent HTTPS domain.
 
+Always start login from `http://127.0.0.1:8765` on the same PC that runs `dashboard.py`. Do not open
+the `trycloudflare.com` address as the dashboard; that address is reserved for Instagram's callback
+and webhook requests. A browser on a different PC cannot use this local dashboard unless the app is
+deployed with authenticated remote dashboard access.
+
 ### Tester and public login access
 
 The button opens Instagram's official authorization screen in a separate window and returns to the
