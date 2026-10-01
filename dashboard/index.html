@@ -397,7 +397,7 @@
         <button id="connect-main" class="primary" type="button">Continue with Instagram</button>
       </section>
       <p id="health-message" role="status" style="margin-bottom:20px"></p>
-      <details class="card" style="margin-bottom:20px">
+      <details id="meta-setup" class="card" style="margin-bottom:20px">
         <summary>Admin setup for comments and messages</summary>
         <p>
           In Meta, open Instagram API → Configure webhooks. Copy these values, click Verify and save, then enable
@@ -443,6 +443,9 @@
         currentUsername = '',
         accountUpdatedAt = null,
         oauthOrigin = '';
+      if (new URLSearchParams(window.location.search).has('setup')) {
+        document.querySelector('#meta-setup').open = true;
+      }
       const total = document.querySelector('#total'),
         comments = document.querySelector('#comments'),
         dms = document.querySelector('#dms'),

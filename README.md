@@ -141,13 +141,43 @@ variables. Variables omitted from `.env` still use the process environment.
 .\start-dashboard.cmd
 ```
 
-Or run it directly:
+The launcher automatically:
+
+- Finds Cloudflare Tunnel, or downloads the official Windows executable and verifies its SHA-256 digest.
+- Starts a new tunnel pointing to this PC's dashboard.
+- Updates only `IG_REDIRECT_URI` and `IG_WEBHOOK_URL` in `.env`, preserving your credentials.
+- Starts the dashboard with those same URLs and verifies the login ticket reaches this installation.
+- Opens the local dashboard with **Admin setup** expanded.
+
+Keep the launcher window open. Press **Ctrl+C** to stop the dashboard, monitor, and tunnel it started.
+It refuses to start if port 8765 is already in use, without changing your settings. Runtime downloads
+and logs are kept in the Git-ignored `.runtime/` folder.
+
+**One Meta step remains for each new temporary hostname:** copy the displayed login redirect URL
+into **Instagram > API setup with Instagram login > Business login settings**, and save it. Set the
+webhook callback URL and verify token from **Admin setup**, verify/save, and enable `comments` and
+`messages`. The launcher cannot register Meta's allowed login URLs using the Instagram credentials
+configured in this project. Its successful connection check verifies the tunnel, not Meta's allowlist.
+
+Do not share an old PC's `trycloudflare.com` hostname with a new installation. Each running local
+dashboard needs its own matching tunnel. Changing an app's webhook callback moves delivery to the
+new receiver; running two independent PCs does not automatically duplicate message delivery.
+
+If you already have a permanent/named tunnel running and have registered its URLs in Meta, preserve
+your existing `.env` URLs and start just the dashboard:
+
+```powershell
+.\start-dashboard.cmd --local-only
+```
+
+Or run the Python dashboard directly without the launcher:
 
 ```powershell
 .\.venv\Scripts\python.exe dashboard.py
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Click **Connect Instagram** and approve access through Meta.
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). After saving any changed URLs in Meta, click
+**Connect Instagram** and approve access.
 
 For local-only use, the dashboard works at this address without a tunnel. Instagram OAuth and
 webhooks require a stable public HTTPS URL. A temporary Cloudflare quick tunnel is suitable for
@@ -209,8 +239,14 @@ Run the local checks before committing:
 .\.venv\Scripts\python.exe dashboard.py --self-test
 .\.venv\Scripts\python.exe examples\comment_monitor.py --self-test
 .\.venv\Scripts\python.exe examples\azure_moderation.py
-npm run build
+.\.venv\Scripts\python.exe tests\test_oauth.py
+.\.venv\Scripts\python.exe tests\test_media_analysis.py
+.\.venv\Scripts\python.exe tests\test_monitor.py
+.\.venv\Scripts\python.exe tests\test_launcher.py
 ```
+
+The Python dashboard does not require Node/npm. For the separate TypeScript sources, install the
+Node dependencies with `npm ci` before running `npm run build`.
 
 The self-tests do not call Instagram or paid AI APIs. End-to-end cloud checks require the configured
 accounts and may incur usage charges.

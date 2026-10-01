@@ -19,3 +19,5 @@ tools/aiograpi-session.json
 tools/seen-comments.json
 tools/monitor-events.jsonl
 tools/accounts/
+.runtime/
+.env.*.tmp
