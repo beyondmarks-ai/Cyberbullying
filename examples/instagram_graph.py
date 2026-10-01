@@ -1,5 +1,6 @@
 import httpx
 import time
+from instagram_api import GRAPH_ROOT, resource_path
 
 
 class InstagramGraphError(RuntimeError):
@@ -9,7 +10,7 @@ class InstagramGraphError(RuntimeError):
 class InstagramGraph:
     def __init__(self, token, user_id):
         self.user_id = str(user_id)
-        self.http = httpx.AsyncClient(base_url="https://graph.instagram.com", timeout=30,
+        self.http = httpx.AsyncClient(base_url=GRAPH_ROOT, timeout=30,
                                       headers={"Authorization": f"Bearer {token}"})
         self.token = token
 
@@ -21,6 +22,10 @@ class InstagramGraph:
         if not data.get('expires_at'):
             data['expires_at'] = token_file.stat().st_mtime + data.get('expires_in', 3600)
             write_json(token_file, data)
+        if data.get('temporary_token'):
+            if data['expires_at'] <= time.time():
+                raise InstagramGraphError('Temporary Instagram token expired. Reconnect Instagram.')
+            return
         if data['expires_at'] - time.time() > 7*86400:
             return
         response = await self.http.get('/refresh_access_token', params={
@@ -34,7 +39,7 @@ class InstagramGraph:
         self.http.headers['Authorization'] = 'Bearer '+self.token
 
     async def _get(self, path, **params):
-        response = await self.http.get(path, params=params)
+        response = await self.http.get(resource_path(path), params=params)
         if response.is_error:
             error = response.json().get("error", {})
             raise InstagramGraphError(f"Instagram error {error.get('code', response.status_code)}: "
@@ -55,7 +60,7 @@ class InstagramGraph:
         return items[:limit]
 
     async def profile(self):
-        return await self._get("/me", fields="id,username")
+        return await self._get("/me", fields="user_id,username")
 
     async def media(self, limit=3):
         return await self.pages(

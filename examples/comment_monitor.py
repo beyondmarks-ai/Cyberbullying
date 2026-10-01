@@ -16,10 +16,12 @@ SCAN_ERRORS = []
 
 
 def load_dotenv():
-    for line in Path(".env").read_text(encoding="utf-8").splitlines():
+    for line in (ROOT / '.env').read_text(encoding="utf-8").splitlines():
         key, separator, value = line.partition("=")
         if separator and not key.lstrip().startswith("#"):
-            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+            # This local monitor uses the project's explicit provider configuration;
+            # inherited credentials/endpoints from other projects must not replace it.
+            os.environ[key.strip()] = value.strip().strip("'\"")
 
 
 def unseen_ids(comment_ids, seen):
@@ -63,18 +65,29 @@ async def moderate(moderator, transcriber, video_moderator, kind, source, text, 
         analyzed_text = f"{text}\nSpoken transcript: {transcript}" if transcript else text
         if videos:
             try:
-                results = [await video_moderator.analyze(video, transcript, text) for video in videos]
-                analysis = max(results, key=lambda result: (result["bullying"], result["confidence"]))
+                results = [await video_moderator.analyze(video, transcript, text, images=images) for video in videos]
+                analysis = max(results, key=lambda result: (result["bullying"],
+                               {'none': 0, 'low': 1, 'medium': 2, 'high': 3}.get(result['severity'], 0),
+                               result["confidence"]))
             except Exception as error:
                 print(f"Gemini video analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
                 for video in videos:
                     images.extend(await asyncio.to_thread(moderator._video_frames, video))
                 analysis = await moderator.analyze(analyzed_text, images)
                 analysis["reason"] = f"Gemini unavailable; Azure frame fallback used. {analysis['reason']}"
+                analysis['coverage'] = 'Sampled frames only; video moments may be missed.'
+        elif images:
+            try:
+                analysis = await video_moderator.analyze_images(images, analyzed_text)
+            except Exception as error:
+                print(f"Gemini image analysis failed: {type(error).__name__}", file=sys.stderr, flush=True)
+                analysis = await moderator.analyze(analyzed_text, images)
+                analysis['reason'] = f"Gemini unavailable; Azure image fallback used. {analysis['reason']}"
         else:
             analysis = await moderator.analyze(analyzed_text, images)
         if audio_failed:
-            analysis["reason"] = f"Audio transcription incomplete; visual/text result only. {analysis['reason']}"
+            analysis['coverage'] = (analysis.get('coverage', '') +
+                                    ' Separate speech transcription unavailable; review audio manually.').strip()
         text = f"{text}\nTranscript: {transcript}" if transcript else text
     except Exception as error:
         analysis = {"bullying": False, "severity": "unknown", "confidence": 0,

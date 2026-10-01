@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT / 'examples'))
 from instagram_store import account_path, write_json, webhook_items
+from instagram_api import GRAPH_ROOT, resource_path
 ENV_FILE = ROOT / ".env"
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 OAUTH_STATES = {}
@@ -82,9 +83,44 @@ def instagram_oauth_url(state):
         "client_id": app_id,
         "redirect_uri": instagram_redirect_uri(),
         "response_type": "code",
+        "enable_fb_login": "false",
+        "force_reauth": "true",
         "scope": OAUTH_SCOPES,
         "state": state,
     })
+
+
+def instagram_request(request, stage, sensitive=()):
+    """Keep Meta's diagnostic details without exposing credentials or request URLs."""
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        payload = {}
+        try:
+            payload = json.loads(error.read())
+            if not isinstance(payload, dict):
+                payload = {}
+            detail = payload.get('error', payload)
+            if not isinstance(detail, dict):
+                detail = {}
+        except (ValueError, TypeError):
+            detail = {}
+        message = str(detail.get('message') or detail.get('error_message') or
+                      payload.get('error_message', ''))
+        message = message or 'Meta returned an error without a JSON explanation.'
+        for value in (*sensitive, setting('IG_APP_SECRET')):
+            if value:
+                for variant in (str(value), urllib.parse.quote(str(value), safe='')):
+                    message = message.replace(variant, '[redacted]')
+        diagnostic = {'stage': stage, 'http_status': error.code,
+                      'message': message, 'code': detail.get('code', detail.get('error_code')),
+                      'trace_id': detail.get('fbtrace_id'), 'time': time.time()}
+        write_json(ROOT / 'tools/accounts/oauth-error.json', diagnostic)
+        suffix = f" (Meta code {diagnostic['code']})" if diagnostic['code'] is not None else ''
+        raise ValueError(f"{stage} failed (HTTP {error.code}){suffix}: {message}") from None
+    except urllib.error.URLError:
+        raise ValueError(f'{stage} failed: could not reach Instagram. Please try again.') from None
 
 
 def instagram_token(code):
@@ -100,12 +136,25 @@ def instagram_token(code):
         "code": code,
     }).encode()
     request = urllib.request.Request("https://api.instagram.com/oauth/access_token", data=body, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read())
-    except (urllib.error.HTTPError, urllib.error.URLError) as error:
-        detail = error.read().decode(errors="replace") if isinstance(error, urllib.error.HTTPError) else str(error)
-        raise ValueError(f"Instagram token exchange failed: {detail}") from error
+    result = instagram_request(request, 'Instagram authorization code exchange', (code,))
+    if not isinstance(result, dict) or not isinstance(result.get('access_token'), str) or not result['access_token']:
+        raise ValueError('Instagram authorization returned no usable access token.')
+    permissions = result.get('permissions')
+    if isinstance(permissions, str):
+        permissions = permissions.replace(',', ' ').split()
+    elif not isinstance(permissions, list):
+        permissions = None
+    # Retain only known scope names and booleans, never tokens or response bodies.
+    granted = sorted({p for p in (permissions or ()) if isinstance(p, str)} & set(OAUTH_SCOPES.split(',')))
+    write_json(ROOT / 'tools/accounts/oauth-permissions.json', {
+        'received_at': time.time(), 'has_token': True,
+        'has_account_id': bool(result.get('user_id')),
+        'permissions_reported': permissions is not None,
+        'granted_requested_permissions': granted,
+    })
+    if permissions is not None and 'instagram_business_basic' not in granted:
+        raise ValueError('Instagram did not grant basic account access. Sign in to the intended professional account and approve access.')
+    return result
 
 
 def long_lived_instagram_token(token_data):
@@ -117,19 +166,28 @@ def long_lived_instagram_token(token_data):
     })
     request = urllib.request.Request(f"https://graph.instagram.com/access_token?{query}")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            long_lived = json.loads(response.read())
-    except (urllib.error.HTTPError, urllib.error.URLError) as error:
-        detail = error.read().decode(errors="replace") if isinstance(error, urllib.error.HTTPError) else str(error)
-        raise ValueError(f"Long-lived Instagram token exchange failed: {detail}") from error
-    return {**token_data, **long_lived, "expires_at": time.time() + long_lived["expires_in"]}
+        long_lived = instagram_request(request, 'Instagram long-lived token exchange', (token_data['access_token'],))
+    except ValueError as error:
+        if "unsupported request - method type: get" in str(error).lower():
+            return {
+                **token_data,
+                "expires_at": time.time() + token_data.get("expires_in", 3600),
+                "temporary_token": True,
+                "token_warning": "Meta issued a short-lived token but refused long-lived conversion. Reconnect when it expires.",
+            }
+        raise
+    return {**token_data, **long_lived, "expires_at": time.time() + long_lived["expires_in"],
+            "temporary_token": False}
 
 
 def save_instagram_token(token_data):
-    request = urllib.request.Request('https://graph.instagram.com/me?fields=id,username',
-                                     headers={'Authorization': 'Bearer '+token_data['access_token']})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        profile = json.loads(response.read())
+    query = urllib.parse.urlencode({'fields': 'user_id,username',
+                                    'access_token': token_data['access_token']})
+    request = urllib.request.Request(f'{GRAPH_ROOT}{resource_path("me")}?{query}')
+    profile = instagram_request(request, 'Instagram profile lookup', (token_data['access_token'],))
+    if not profile.get('username') or not profile.get('user_id'):
+        raise ValueError('Instagram profile lookup returned no professional account ID or username.')
+    token_data['user_id'] = str(profile['user_id'])
     token_data['username'] = profile['username']
     path = account_path(token_data['user_id'], 'instagram.json')
     write_json(path, token_data)
@@ -237,29 +295,34 @@ def main():
                 with lock:
                     saved = OAUTH_STATES.pop(state, None)
                 if not saved or saved[0] < time.time() or saved[1] != instagram_redirect_uri():
-                    return self.send_html('Login expired or redirect changed. Start login again.', 400)
+                    return self.send_oauth_result('Login expired or redirect changed. Please try again.', False, 400)
                 if query.get("error"):
-                    return self.send_html(query.get("error_description", query["error"])[0], 400)
+                    return self.send_oauth_result(query.get("error_description", query["error"])[0], False, 400)
                 try:
                     code = query.get("code", [""])[0]
                     if not code:
-                        return self.send_html("Instagram did not return an authorization code.", 400)
+                        return self.send_oauth_result("Instagram did not return an authorization code.", False, 400)
                     token_data = long_lived_instagram_token(instagram_token(code))
                     path = save_instagram_token(token_data)
                     with lock:
                         start_monitor()
-                    return self.send_html(f"Instagram connected. Token saved to {path.name}. You can close this window.")
-                except (ValueError, KeyError) as error:
-                    return self.send_html(str(error), 500)
+                    return self.send_oauth_result("Your account is ready. The dashboard will update automatically.")
+                except (ValueError, KeyError, urllib.error.HTTPError, urllib.error.URLError) as error:
+                    return self.send_oauth_result(str(error), False, 500)
             if self.path == "/api/events":
                 return self.send_json(read_events(account['user_id']) if account.get('user_id') else [])
             if self.path == "/api/status":
                 health = {}
+                token_file = instagram_token_file()
                 if account.get('user_id'):
                     health_path = account_path(account['user_id'], 'status.json')
                     if health_path.exists():
                         health = json.loads(health_path.read_text(encoding='utf-8'))
-                return self.send_json({**health, "running": monitor is not None and monitor.poll() is None, "username": username})
+                return self.send_json({**health,
+                                       "running": monitor is not None and monitor.poll() is None,
+                                       "username": username,
+                                       "auth_warning": account.get("token_warning", ""),
+                                       "account_updated_at": token_file.stat().st_mtime if token_file else None})
             if self.path == "/api/account":
                 return self.send_json({"username": username})
             if self.path == '/api/setup':
@@ -319,6 +382,32 @@ def main():
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_oauth_result(self, message, success=True, status=200):
+            result = json.dumps({
+                'type': 'instagram-oauth',
+                'ok': success,
+                'message': message,
+            }).replace('<', '\\u003c')
+            title = 'Instagram connected' if success else 'Instagram connection failed'
+            data = f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>{title}</title><style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#f8fafc;
+font:16px/1.5 system-ui,sans-serif}}main{{width:min(420px,calc(100% - 32px));text-align:center}}
+.icon{{font-size:3rem}}p{{color:#b0bdd0}}
+</style></head><body><main><div class="icon">{'✓' if success else '!'}</div>
+<h1>{title}</h1><p>{html.escape(message)}</p><p>You can close this window.</p></main>
+<script>const result={result};if(window.opener){{window.opener.postMessage(result,'http://127.0.0.1:8765');
+if(result.ok)setTimeout(()=>window.close(),700);}}</script></body></html>'''.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)

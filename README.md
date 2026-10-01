@@ -13,10 +13,11 @@ severity, confidence, and a short explanation.
 ## Features
 
 - Continuous polling for new comments and recent media
-- Text and image moderation with Azure OpenAI
+- Text moderation with Azure OpenAI
+- Image content summaries and moderation with Vertex AI Gemini
 - Voice-note and video-audio transcription with Sarvam AI Saaras v4
 - Native video analysis with Vertex AI Gemini 3.8 Flash for videos up to 60 seconds
-- Automatic Azure frame-analysis fallback when Gemini is unavailable
+- Automatic Azure image/frame-analysis fallback when Gemini is unavailable
 - Per-account session, seen-item, and event isolation
 - Browser-based Instagram OAuth account connection
 - Responsive, keyboard-accessible local dashboard with alert filters
@@ -29,7 +30,7 @@ flowchart LR
     A[Instagram account] --> B[Official Instagram API]
     B --> C{New content type}
     C -->|Comment or DM text| D[Azure OpenAI]
-    C -->|Image| D
+    C -->|Image| G
     C -->|Voice note| E[Sarvam transcription]
     E --> D
     C -->|Video up to 60 seconds| F[Sarvam transcript]
@@ -46,13 +47,18 @@ flowchart LR
 | Content               | Primary analysis                        | Fallback                         |
 | --------------------- | --------------------------------------- | -------------------------------- |
 | Comments and text DMs | Azure OpenAI                            | Recorded as analysis unavailable |
-| Images                | Azure OpenAI vision                     | Recorded as analysis unavailable |
+| Images                | Vertex AI Gemini                        | Azure OpenAI vision              |
 | Voice notes           | Sarvam transcript, then Azure OpenAI    | Recorded as analysis unavailable |
 | Videos                | Gemini 3.8 Flash with Sarvam transcript | Azure OpenAI over sampled frames |
 
 Every AI result is normalized to the same schema: bullying status, confidence, severity, reason, and
 categories. The application reports potential harm; it does not delete, hide, reply to, or otherwise
 moderate Instagram content automatically.
+
+Images and videos also show a short content summary in the dashboard's **Media** filter. Vertex
+uses a structured JSON response with a 1,600-token output allowance and one retry at 3,200 tokens
+if the result is incomplete. Videos are limited to their first 60 seconds. Model confidence is not
+a measured accuracy score. Unavailable analysis is shown explicitly and failed items are retried.
 
 ## Requirements
 
@@ -68,14 +74,29 @@ the packages pinned in `requirements.txt`.
 
 ## Setup
 
-### 1. Create the Python environment
+### 1. Install the project on another Windows PC
+
+Install Python 3.11+, Git, FFmpeg, Azure CLI, and Google Cloud CLI. Then clone the repository:
+
+```powershell
+git clone https://github.com/beyondmarks-ai/Cyberbullying.git
+Set-Location Cyberbullying
+```
+
+FFmpeg must be available as `ffmpeg` in PowerShell. After installing it, verify with:
+
+```powershell
+ffmpeg -version
+```
+
+### 2. Create the Python environment
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-### 2. Authenticate the cloud CLIs
+### 3. Authenticate the cloud CLIs
 
 ```powershell
 az login
@@ -87,7 +108,7 @@ gcloud services enable aiplatform.googleapis.com
 The Azure identity must be allowed to list keys for the configured Azure OpenAI resource. The Google
 identity needs permission to call Vertex AI models in the selected project.
 
-### 3. Configure the application
+### 4. Configure the application
 
 ```powershell
 Copy-Item .env.example .env
@@ -98,8 +119,8 @@ Edit `.env` and provide the following values:
 | Variable                  | Required | Purpose                                                |
 | ------------------------- | -------: | ------------------------------------------------------ |
 | `IG_POLL_SECONDS`         |       No | Poll interval; defaults to `60`                        |
-| `IG_APP_ID`               |      Yes | Meta Instagram app ID                                  |
-| `IG_APP_SECRET`           |      Yes | Meta Instagram app secret; stored locally only         |
+| `IG_APP_ID`               |      Yes | Instagram App ID from Business login settings          |
+| `IG_APP_SECRET`           |      Yes | Instagram App Secret from Business login settings      |
 | `IG_REDIRECT_URI`         |      Yes | OAuth callback URL registered in Meta                  |
 | `AZURE_OPENAI_GROUP`      |      Yes | Azure resource group                                   |
 | `AZURE_OPENAI_RESOURCE`   |      Yes | Azure OpenAI account name                              |
@@ -111,8 +132,10 @@ Edit `.env` and provide the following values:
 | `GOOGLE_VIDEO_MODEL`      |       No | Video model; defaults to `gemini-3.8-flash`            |
 
 Do not commit `.env`. It is intentionally ignored by Git.
+The monitor uses values explicitly set in this project's `.env` ahead of inherited environment
+variables. Variables omitted from `.env` still use the process environment.
 
-### 4. Start the dashboard
+### 5. Start the dashboard
 
 ```powershell
 .\start-dashboard.cmd
@@ -125,6 +148,28 @@ Or run it directly:
 ```
 
 Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Click **Connect Instagram** and approve access through Meta.
+
+For local-only use, the dashboard works at this address without a tunnel. Instagram OAuth and
+webhooks require a stable public HTTPS URL. A temporary Cloudflare quick tunnel is suitable for
+testing, but its hostname changes when restarted; update `IG_REDIRECT_URI`, `IG_WEBHOOK_URL`, and
+the matching Meta settings each time. For a reliable deployment, use a named Cloudflare tunnel or
+host the dashboard behind a permanent HTTPS domain.
+
+### Tester and public login access
+
+The button opens Instagram's official authorization screen in a separate window and returns to the
+dashboard automatically. Meta still controls which accounts may authorize the app:
+
+- While the Meta app is in **Development** mode, only app-role users and Instagram testers who have
+  accepted their invitation can connect.
+- Testers must sign in to the same Instagram Professional (Business or Creator) account that was
+  added in the Meta developer dashboard.
+- To let non-testers connect, switch the Meta app to **Live** and obtain any required App Review /
+  Advanced Access for `instagram_business_basic`, `instagram_business_manage_comments`, and
+  `instagram_business_manage_messages`.
+
+This local dashboard has one active account at a time. A public, multi-user deployment also requires
+authenticated application users, encrypted per-user token storage, and per-user data isolation.
 
 ## Monitoring behavior
 

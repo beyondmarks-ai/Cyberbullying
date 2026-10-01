@@ -96,6 +96,19 @@
       }
       .label {
         color: var(--muted);
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .icon {
+        width: 20px;
+        height: 20px;
+        flex: 0 0 auto;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.75;
+        stroke-linecap: round;
+        stroke-linejoin: round;
       }
       .alert-banner {
         margin-bottom: 20px;
@@ -105,6 +118,7 @@
       }
       .toolbar {
         display: flex;
+        flex-wrap: wrap;
         justify-content: space-between;
         align-items: center;
         gap: 16px;
@@ -114,6 +128,16 @@
         display: flex;
         flex-wrap: wrap;
         gap: 8px;
+      }
+      .filters button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+      }
+      .filters .icon {
+        width: 18px;
+        height: 18px;
       }
       button {
         min-height: 44px;
@@ -144,6 +168,27 @@
       }
       .account-name {
         color: var(--muted);
+      }
+      .primary {
+        color: #082f49;
+        background: var(--blue);
+        border-color: var(--blue);
+        font-weight: 700;
+      }
+      .connect-card {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 24px;
+        margin-bottom: 20px;
+        border-color: #0ea5e9;
+      }
+      .connect-card h2 {
+        margin-bottom: 4px;
+      }
+      .connection-message {
+        min-height: 24px;
+        margin-bottom: 12px;
       }
       dialog {
         width: min(440px, calc(100% - 32px));
@@ -210,6 +255,10 @@
         background: #351b27;
       }
       .badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        max-width: 100%;
         width: max-content;
         border-radius: 999px;
         padding: 4px 9px;
@@ -218,6 +267,10 @@
         font-size: 0.8rem;
         font-weight: 700;
         text-transform: uppercase;
+      }
+      .badge .icon {
+        width: 16px;
+        height: 16px;
       }
       .badge.dm {
         color: #052e16;
@@ -261,7 +314,8 @@
       }
       @media (max-width: 650px) {
         header,
-        .toolbar {
+        .toolbar,
+        .connect-card {
           align-items: stretch;
           flex-direction: column;
         }
@@ -283,11 +337,48 @@
     </style>
   </head>
   <body>
+    <svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false" style="position:absolute;width:0;height:0;overflow:hidden">
+      <symbol id="icon-message" viewBox="0 0 24 24">
+        <path d="M21 11.5a8.5 8.5 0 0 1-12.4 7.6L3 21l1.9-5.6A8.5 8.5 0 1 1 21 11.5Z"/>
+        <path d="M8 10h8M8 14h5"/>
+      </symbol>
+      <symbol id="icon-comment" viewBox="0 0 24 24">
+        <path d="M20 4H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h4l4 4v-4h8a1 1 0 0 0 1-1V5a1 1 0 0 0-1-1Z"/>
+        <path d="M7 9h10M7 13h7"/>
+      </symbol>
+      <symbol id="icon-image" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="18" height="18" rx="3"/>
+        <circle cx="8" cy="8" r="1.5"/>
+        <path d="m21 15-5-5-8 11M11 18l-4-4-4 4"/>
+      </symbol>
+      <symbol id="icon-video" viewBox="0 0 24 24">
+        <rect x="2.5" y="5" width="19" height="14" rx="3"/>
+        <path d="m10 9 5 3-5 3Z"/>
+      </symbol>
+      <symbol id="icon-audio" viewBox="0 0 24 24">
+        <path d="M4 10v4M8 6v12M12 3v18M16 6v12M20 10v4"/>
+      </symbol>
+      <symbol id="icon-media" viewBox="0 0 24 24">
+        <rect x="7" y="3" width="14" height="14" rx="2"/>
+        <path d="M3 7v12a2 2 0 0 0 2 2h12M7 14l4-4 4 4 3-3 3 3"/>
+        <circle cx="16" cy="7" r="1"/>
+      </symbol>
+      <symbol id="icon-grid" viewBox="0 0 24 24">
+        <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+        <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+        <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+        <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+      </symbol>
+      <symbol id="icon-alert" viewBox="0 0 24 24">
+        <path d="m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6Z"/>
+        <path d="M12 8v5M12 16h.01"/>
+      </symbol>
+    </svg>
     <main>
       <header>
         <div>
           <h1>Instagram Safety Monitor</h1>
-          <p>Azure checks text/images, Sarvam transcribes audio, and Gemini analyzes one-minute videos</p>
+          <p>Automatic checks for messages, images, and videos up to one minute</p>
         </div>
         <div class="account-controls">
           <span id="account-name" class="account-name"></span
@@ -297,9 +388,17 @@
           </div>
         </div>
       </header>
+      <p id="connection-message" class="connection-message" role="status" aria-live="polite"></p>
+      <section id="connect-card" class="card connect-card" aria-labelledby="connect-heading" hidden>
+        <div>
+          <h2 id="connect-heading">Connect your Instagram account</h2>
+          <p>Sign in securely through Instagram. Your password is never shared with this dashboard.</p>
+        </div>
+        <button id="connect-main" class="primary" type="button">Continue with Instagram</button>
+      </section>
       <p id="health-message" role="status" style="margin-bottom:20px"></p>
       <details class="card" style="margin-bottom:20px">
-        <summary>Finish connecting comments and messages in Meta</summary>
+        <summary>Admin setup for comments and messages</summary>
         <p>
           In Meta, open Instagram API → Configure webhooks. Copy these values, click Verify and save, then enable
           comments and messages. New events require Meta to deliver webhooks to this URL.
@@ -313,10 +412,10 @@
         <strong>Bullying detected.</strong> Review the red activity below.
       </div>
       <section class="stats" aria-label="Activity summary">
-        <div class="card"><span id="total" class="number">0</span><span class="label">Total captured</span></div>
-        <div class="card"><span id="comments" class="number">0</span><span class="label">Comments</span></div>
-        <div class="card"><span id="dms" class="number">0</span><span class="label">Direct messages</span></div>
-        <div class="card"><span id="alerts" class="number">0</span><span class="label">Bullying alerts</span></div>
+        <div class="card"><span id="total" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-grid"/></svg>Total captured</span></div>
+        <div class="card"><span id="comments" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-comment"/></svg>Comments</span></div>
+        <div class="card"><span id="dms" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-message"/></svg>Direct messages</span></div>
+        <div class="card"><span id="alerts" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-alert"/></svg>Bullying alerts</span></div>
       </section>
       <section aria-labelledby="activity-heading">
         <div class="toolbar">
@@ -325,11 +424,13 @@
             <p>Refreshes automatically every five seconds</p>
           </div>
           <div class="filters" aria-label="Filter activity">
-            <button data-filter="all" aria-pressed="true">All</button
-            ><button data-filter="alert" aria-pressed="false">Alerts</button
-            ><button data-filter="comment" aria-pressed="false">Comments</button
-            ><button data-filter="dm" aria-pressed="false">Messages</button
-            ><button data-filter="media" aria-pressed="false">Media</button>
+            <button data-filter="all" aria-pressed="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-grid"/></svg>All</button>
+            <button data-filter="alert" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-alert"/></svg>Alerts</button>
+            <button data-filter="comment" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-comment"/></svg>Comments</button>
+            <button data-filter="dm" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-message"/></svg>Messages</button>
+            <button data-filter="image" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-image"/></svg>Images</button>
+            <button data-filter="video" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-video"/></svg>Videos</button>
+            <button data-filter="media" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-media"/></svg>Media</button>
           </div>
         </div>
         <div id="events"><div class="card empty">Waiting for new activity…</div></div>
@@ -339,7 +440,9 @@
       let events = [],
         filter = 'all',
         lastAlerts = 0,
-        currentUsername = '';
+        currentUsername = '',
+        accountUpdatedAt = null,
+        oauthOrigin = '';
       const total = document.querySelector('#total'),
         comments = document.querySelector('#comments'),
         dms = document.querySelector('#dms'),
@@ -347,7 +450,22 @@
         alertBanner = document.querySelector('#alert-banner'),
         status = document.querySelector('#status'),
         eventList = document.querySelector('#events'),
-        accountName = document.querySelector('#account-name');
+        accountName = document.querySelector('#account-name'),
+        changeAccount = document.querySelector('#change-account'),
+        connectMain = document.querySelector('#connect-main'),
+        connectCard = document.querySelector('#connect-card'),
+        connectionMessage = document.querySelector('#connection-message');
+      function activityIcon(kind) {
+        const names = { dm: 'message', comment: 'comment', image: 'image', video: 'video', audio: 'audio' };
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'icon');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.setAttribute('focusable', 'false');
+        const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+        use.setAttribute('href', `#icon-${names[kind] || 'media'}`);
+        svg.append(use);
+        return svg;
+      }
       function render() {
         const alertCount = events.filter(e => e.analysis?.bullying).length;
         total.textContent = events.length;
@@ -384,22 +502,37 @@
             time = document.createElement('time');
           row.className = `card event${flagged ? ' alert' : ''}`;
           badge.className = `badge ${flagged ? 'alert' : event.kind}`;
-          badge.textContent = flagged
+          const badgeLabel = document.createElement('span');
+          badgeLabel.textContent = flagged
             ? 'Bullying detected'
             : event.kind === 'dm'
             ? 'Message'
             : event.kind[0].toUpperCase() + event.kind.slice(1);
+          badge.append(activityIcon(event.kind), badgeLabel);
           source.textContent = event.source;
           message.className = 'message';
           message.textContent = event.text;
           body.append(source, message);
+          if (event.analysis?.content_summary) {
+            const summary = document.createElement('p');
+            summary.textContent = `Content: ${event.analysis.content_summary}`;
+            body.append(summary);
+          }
           if (event.analysis) {
             const analysis = document.createElement('div');
             analysis.className = 'analysis';
-            analysis.textContent = `${event.analysis.severity} severity · ${Math.round(
-              event.analysis.confidence * 100,
-            )}% confidence · ${event.analysis.reason}`;
+            const unavailable = event.analysis.severity === 'unknown';
+            analysis.textContent = unavailable
+              ? 'Analysis unavailable — this content has not been assessed.'
+              : `${flagged ? 'Potential bullying detected' : 'No bullying detected'} · ${event.analysis.severity} severity · ${Math.round(
+                  event.analysis.confidence * 100,
+                )}% model confidence · ${event.analysis.reason}`;
             body.append(analysis);
+            if (event.analysis.coverage) {
+              const coverage = document.createElement('p');
+              coverage.textContent = event.analysis.coverage;
+              body.append(coverage);
+            }
           }
           time.dateTime = event.time;
           time.textContent = new Date(event.time).toLocaleString();
@@ -414,11 +547,17 @@
           events = await eventResponse.json();
           const state = await statusResponse.json();
           currentUsername = state.username;
+          accountUpdatedAt = state.account_updated_at;
           accountName.textContent = currentUsername ? `Signed in as @${currentUsername}` : 'No account signed in';
+          changeAccount.textContent = currentUsername ? 'Switch account' : 'Connect Instagram';
+          connectCard.hidden = Boolean(currentUsername);
+          if (state.auth_warning && currentUsername) connectionMessage.textContent = state.auth_warning;
           const fresh = state.updated_at && Date.now() - Date.parse(state.updated_at) < 180000;
           const healthy = state.running && fresh && state.state === 'healthy';
           status.classList.toggle('offline', !healthy);
-          status.lastElementChild.textContent = !state.running
+          status.lastElementChild.textContent = !currentUsername
+            ? 'Not connected'
+            : !state.running
             ? 'Monitor stopped'
             : !fresh
             ? 'Waiting for scan'
@@ -427,19 +566,51 @@
             : healthy
             ? 'Monitoring live'
             : 'Needs attention';
-          document.querySelector('#health-message').textContent =
-            (state.errors || []).join(' ') +
-            (state.updated_at ? ' Last scan: ' + new Date(state.updated_at).toLocaleString() : '');
+          document.querySelector('#health-message').textContent = currentUsername
+            ? (state.errors || []).join(' ') +
+              (state.updated_at ? ' Last scan: ' + new Date(state.updated_at).toLocaleString() : '')
+            : '';
           render();
         } catch {
           status.classList.add('offline');
           status.lastElementChild.textContent = 'Dashboard disconnected';
         }
       }
+      let loginWindow, loginPoll;
       function openLogin() {
-        window.location.href = '/auth/instagram/start';
+        const previousAccountUpdate = accountUpdatedAt;
+        connectionMessage.textContent = 'Opening Instagram secure login…';
+        changeAccount.disabled = true;
+        connectMain.disabled = true;
+        loginWindow = window.open('/auth/instagram/start', 'instagram-login', 'popup,width=560,height=760');
+        if (!loginWindow) {
+          window.location.href = '/auth/instagram/start';
+          return;
+        }
+        clearInterval(loginPoll);
+        loginPoll = setInterval(async () => {
+          await refresh();
+          if (accountUpdatedAt && accountUpdatedAt !== previousAccountUpdate) finishLogin(true);
+          else if (loginWindow.closed) finishLogin(false);
+        }, 1000);
       }
-      document.querySelector('#change-account').addEventListener('click', openLogin);
+      function finishLogin(success, message = '') {
+        clearInterval(loginPoll);
+        changeAccount.disabled = false;
+        connectMain.disabled = false;
+        connectionMessage.textContent =
+          message || (success ? 'Instagram connected successfully.' : 'Login was not completed.');
+        if (success) {
+          loginWindow?.close();
+          refresh();
+        }
+      }
+      window.addEventListener('message', event => {
+        if (!oauthOrigin || event.origin !== oauthOrigin || event.data?.type !== 'instagram-oauth') return;
+        finishLogin(event.data.ok, event.data.message);
+      });
+      changeAccount.addEventListener('click', openLogin);
+      connectMain.addEventListener('click', openLogin);
       document.querySelectorAll('[data-filter]').forEach(button =>
         button.addEventListener('click', () => {
           filter = button.dataset.filter;
@@ -457,6 +628,7 @@
           document.querySelector('#webhook-url').value = s.callback_url;
           document.querySelector('#webhook-token').value = s.verify_token;
           document.querySelector('#redirect-url').value = s.redirect_url;
+          oauthOrigin = new URL(s.redirect_url).origin;
         })
         .catch(() => {});
     </script>
