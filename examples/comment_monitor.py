@@ -6,10 +6,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aiograpi import Client
 from azure_moderation import AzureModerator, GeminiVideoModerator, SarvamTranscriber
+from instagram_graph import InstagramGraph
+from instagram_store import account_path, write_json, ROOT
 
 SESSION_FILE = SEEN_FILE = EVENT_FILE = None
+STATUS_FILE = None
+SCAN_ERRORS = []
 
 
 def load_dotenv():
@@ -30,38 +33,14 @@ def account_files(username):
     return folder / f"{account}-session.json", folder / f"{account}-seen.json", folder / f"{account}-events.jsonl"
 
 
-def record_event(kind, source, text, analysis):
+def record_event(kind, source, text, analysis, event_id=None):
     event = {"kind": kind, "source": source, "text": text, "analysis": analysis,
-             "time": datetime.now(timezone.utc).isoformat()}
+             "time": datetime.now(timezone.utc).isoformat(), "id": event_id}
     with EVENT_FILE.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def media_urls(media):
-    items = media.resources or [media]
-    return [(str(item.video_url), "video") if item.video_url else (str(item.thumbnail_url), "image")
-            for item in items if item.video_url or item.thumbnail_url]
-
-
-def message_media(message):
-    for item in (message.media, message.media_share, message.clip):
-        if item:
-            if getattr(item, "audio_url", None):
-                return str(item.audio_url), "audio"
-            if getattr(item, "video_url", None):
-                return str(item.video_url), "video"
-            if getattr(item, "thumbnail_url", None):
-                return str(item.thumbnail_url), "image"
-    visual = getattr(message.visual_media, "media", None)
-    if visual:
-        if visual.video_versions:
-            return str(visual.video_versions[0].url), "video"
-        if visual.image_versions2 and visual.image_versions2.candidates:
-            return str(visual.image_versions2.candidates[0].url), "image"
-    return None, None
-
-
-async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None):
+async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None, event_id=None):
     try:
         images, videos, transcripts, audio_failed = [], [], [], False
         for url, media_kind in (media or []):
@@ -101,74 +80,89 @@ async def moderate(moderator, transcriber, video_moderator, kind, source, text, 
         analysis = {"bullying": False, "severity": "unknown", "confidence": 0,
                     "reason": f"Analysis failed: {type(error).__name__}", "categories": []}
         print(f"AI analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-    record_event(kind, source, text, analysis)
-    print(f"AI {'BULLYING' if analysis['bullying'] else 'safe'}: {source} ({analysis['severity']})", flush=True)
+        SCAN_ERRORS.append('AI analysis failed. Check Azure/Sarvam/Gemini configuration.')
+    record_event(kind, source, text, analysis, event_id)
+    label = 'unavailable' if analysis['severity'] == 'unknown' else ('BULLYING' if analysis['bullying'] else 'safe')
+    print(f"AI {label}: {source} ({analysis['severity']})", flush=True)
+    return analysis["severity"] != "unknown"
 
 
 async def main():
-    global SESSION_FILE, SEEN_FILE, EVENT_FILE
+    global SESSION_FILE, SEEN_FILE, EVENT_FILE, STATUS_FILE
     load_dotenv()
-    username = os.environ.get("IG_USERNAME")
-    password = os.environ.get("IG_PASSWORD")
-    if not username or not password:
-        raise SystemExit("Set IG_USERNAME and IG_PASSWORD in .env")
-
-    SESSION_FILE, SEEN_FILE, EVENT_FILE = account_files(username)
-    interval = int(os.environ.get("IG_POLL_SECONDS", "60"))
-    client = Client()
-    client.delay_range = [1, 3]
-    if SESSION_FILE.exists():
-        client.load_settings(SESSION_FILE)
-    await client.login(username, password)
-    client.dump_settings(SESSION_FILE)
+    token_file = os.environ.get("IG_TOKEN_FILE")
+    if not token_file or not Path(token_file).exists():
+        raise SystemExit("Connect Instagram first; IG_TOKEN_FILE is missing")
+    token_data = json.loads(Path(token_file).read_text(encoding="utf-8"))
+    client = InstagramGraph(token_data["access_token"], token_data["user_id"])
+    await client.refresh_if_needed(token_data, Path(token_file))
+    profile = await client.profile()
+    username = profile["username"]
+    token_data['username'] = username
+    write_json(Path(token_file), token_data)
+    SEEN_FILE = account_path(token_data['user_id'], 'seen.json')
+    EVENT_FILE = account_path(token_data['user_id'], 'events.jsonl')
+    STATUS_FILE = account_path(token_data['user_id'], 'status.json')
+    inbox = account_path(token_data['user_id'], 'inbox')
+    interval = max(30, int(os.environ.get("IG_POLL_SECONDS", "60")))
 
     moderator = AzureModerator()
     transcriber = SarvamTranscriber(moderator.http)
     video_moderator = GeminiVideoModerator(moderator.http)
-    user_id = await client.user_id_from_username(username)
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
-    dm_baselined = any(item.startswith("dm:") for item in seen)
-    print(f"Monitoring @{username}'s comments, DMs, and media every {interval} seconds. Press Ctrl+C to stop.")
+    print(f"Monitoring @{username}'s comments and media every {interval} seconds. Press Ctrl+C to stop.")
 
     while True:
+        SCAN_ERRORS.clear()
+        write_json(STATUS_FILE, {'state': 'scanning', 'username': username,
+                                'updated_at': datetime.now(timezone.utc).isoformat()})
         try:
-            for media in await client.user_medias(user_id, amount=3):
-                media_id = f"media:{media.id}"
+            await client.refresh_if_needed(token_data, Path(token_file))
+            for pending in sorted(inbox.glob('*.json')):
+                item = json.loads(pending.read_text(encoding='utf-8'))
+                if item['id'] not in seen:
+                    if await moderate(moderator, transcriber, video_moderator, item['kind'], item['source'],
+                                      item['text'], item['media'], item['id']):
+                        seen.add(item['id'])
+                if item['id'] in seen:
+                    write_json(SEEN_FILE, sorted(seen))
+                    pending.unlink()
+            for media in await client.media(100):
+                media_id = f"media:{media['id']}"
                 if media_id not in seen:
-                    assets = media_urls(media)
-                    kind = "video" if any(media_kind == "video" for _, media_kind in assets) else "image"
-                    await moderate(moderator, transcriber, video_moderator, kind, f"post {media.code}", media.caption_text or "Post media", assets)
-                    seen.add(media_id)
-                comments = await client.media_comments(media.id, amount=100)
-                new_ids = unseen_ids([str(comment.pk) for comment in comments], seen)
+                    parts = await client.children(media['id']) if media.get('media_type') == 'CAROUSEL_ALBUM' else [media]
+                    assets = [(p['media_url'], 'video' if p.get('media_type') == 'VIDEO' else 'image')
+                              for p in parts if p.get('media_url')]
+                    kind = 'video' if any(k == 'video' for _, k in assets) else 'image'
+                    analyzed = await moderate(moderator, transcriber, video_moderator, kind, f"post {media['id']}", media.get("caption", "Post media"), assets, media_id)
+                    if analyzed:
+                        seen.add(media_id)
+                comments = await client.comments(media["id"], 100)
+                if media.get('comments_count', 0) and not comments:
+                    SCAN_ERRORS.append(f"Instagram reports {media['comments_count']} comments on post {media['id']}, but returned no comment records. Access or visibility needs checking in Meta.")
+                replies = []
                 for comment in comments:
-                    if str(comment.pk) in new_ids:
-                        print(f"NEW [{media.code}] @{comment.user.username}: {comment.text}", flush=True)
-                        await moderate(moderator, transcriber, video_moderator, "comment", f"@{comment.user.username} · post {media.code}", comment.text)
-                seen.update(new_ids)
-            threads = await client.direct_threads(amount=20, thread_message_limit=20)
-            threads += await client.direct_pending_inbox(amount=20)
-            for thread in threads:
-                for message in thread.messages:
-                    message_id = f"dm:{message.id}"
-                    if dm_baselined and message_id not in seen and not message.is_sent_by_viewer:
-                        sender = next((user.username for user in thread.users if str(user.pk) == str(message.user_id)),
-                                      str(message.user_id))
-                        if message.text:
-                            print(f"NEW DM @{sender}: {message.text}", flush=True)
-                            await moderate(moderator, transcriber, video_moderator, "dm", f"@{sender}", message.text)
-                        url, kind = message_media(message)
-                        if url:
-                            print(f"NEW DM {kind} @{sender}", flush=True)
-                            await moderate(moderator, transcriber, video_moderator, kind, f"@{sender} · direct message", f"Incoming {kind}", [(url, kind)])
-                    seen.add(message_id)
-            if not dm_baselined:
-                dm_baselined = True
-                print("Existing DMs baselined; new incoming messages will now be analyzed.", flush=True)
+                    replies.extend(await client.replies(comment['id']))
+                comments.extend(replies)
+                for comment in comments:
+                    comment_id = 'comment:'+str(comment['id'])
+                    if comment_id not in seen:
+                        author = comment.get("username") or (comment.get("from") or {}).get("username") or "unknown"
+                        print(f"NEW [post {media['id']}] @{author}: {comment.get('text', '')}", flush=True)
+                        analyzed = await moderate(moderator, transcriber, video_moderator, "comment", f"@{author} · post {media['id']}", comment.get("text", ""), event_id=comment_id)
+                        if analyzed:
+                            seen.add(comment_id)
             # ponytail: unbounded test-account history; prune when this file becomes materially large.
-            SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
+            write_json(SEEN_FILE, sorted(seen))
         except Exception as error:
-            print(f"Scan failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            SCAN_ERRORS.append(f'Scan failed: {type(error).__name__}. Check monitor log; reconnect if the token expired.')
+        write_json(STATUS_FILE, {'state': 'error' if SCAN_ERRORS else 'healthy', 'username': username,
+                                'errors': list(dict.fromkeys(SCAN_ERRORS)),
+                                'updated_at': datetime.now(timezone.utc).isoformat()})
+        if '--once' in sys.argv:
+            await client.close()
+            await moderator.http.aclose()
+            return
         await asyncio.sleep(interval)
 
 
@@ -181,16 +175,7 @@ if __name__ == "__main__":
         async def login_test():
             global SESSION_FILE, SEEN_FILE, EVENT_FILE
             load_dotenv()
-            username, password = os.environ.get("IG_USERNAME"), os.environ.get("IG_PASSWORD")
-            if not username or not password:
-                raise SystemExit("Missing Instagram credentials")
-            SESSION_FILE, SEEN_FILE, EVENT_FILE = account_files(username)
-            client = Client()
-            if SESSION_FILE.exists():
-                client.load_settings(SESSION_FILE)
-            await client.login(username, password)
-            client.dump_settings(SESSION_FILE)
-            print("Login verified")
+            raise SystemExit("Password login was removed; use the Instagram OAuth flow")
         asyncio.run(login_test())
     else:
         try:

@@ -59,10 +59,14 @@ class AzureModerator:
         az = shutil.which("az")
         if not az:
             raise RuntimeError("Azure CLI is not installed or is not on PATH")
-        result = subprocess.run(
-            [az, "cognitiveservices", "account", "keys", "list", "-g", self.group, "-n", self.resource,
-             "--query", "key1", "-o", "tsv"], capture_output=True, text=True, check=True,
-        )
+        try:
+            result = subprocess.run(
+                [az, "cognitiveservices", "account", "keys", "list", "-g", self.group, "-n", self.resource,
+                 "--query", "key1", "-o", "tsv"], capture_output=True, text=True, check=True,
+            )
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or "Azure CLI returned an error.").strip()
+            raise RuntimeError(f"Azure CLI key lookup failed: {detail}") from error
         self.key = result.stdout.strip()
         if not self.key:
             raise RuntimeError("Azure CLI returned no Azure OpenAI key")
