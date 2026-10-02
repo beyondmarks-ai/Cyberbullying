@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / 'examples'))
 from instagram_store import account_path, write_json, webhook_items
 from instagram_api import GRAPH_ROOT, resource_path
 from preview_storage import PreviewStore
+from history_sync import HistorySyncManager, read_history, read_live_events
 ENV_FILE = ROOT / ".env"
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 OAUTH_STATES = {}
@@ -57,19 +58,17 @@ def connected_account():
 
 
 def read_events(account_id):
-    path = account_path(account_id, 'events.jsonl')
-    if not path.exists():
-        return []
-    events = []
-    for line in path.read_text(encoding="utf-8").splitlines()[-200:]:
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            pass
-    latest = {}
-    for index, event in enumerate(events):
-        latest[event.get('id') or str(index)] = event
-    return list(reversed(list(latest.values())))
+    latest = read_history(account_id).get('events', {})
+    for event_id, live in read_live_events(account_id).items():
+        history = latest.get(event_id, {})
+        merged = {**live, **history}
+        # Live moderation may finish after import. Never replace it with stale results.
+        if live.get('analysis') is not None:
+            merged['analysis'] = live['analysis']
+        if live.get('previews'):
+            merged['previews'] = live['previews']
+        latest[event_id] = merged
+    return sorted(latest.values(), key=lambda e: e.get('time', ''), reverse=True)[:500]
 
 
 def instagram_redirect_uri():
@@ -199,13 +198,30 @@ def webhook_verify_token():
     return hmac.new(setting('IG_APP_SECRET').encode(), b'instagram-webhook-verify', 'sha256').hexdigest()
 
 
-def preview_action(headers, account, path, method='GET'):
+def local_ui_request(headers, request_header):
     # Loopback-only UI, no tunnel access, cross-site reads, DNS rebinding or CSRF.
     origins = {'http://127.0.0.1:8765', 'http://localhost:8765'}
-    if (headers.get('Host') not in {'127.0.0.1:8765', 'localhost:8765'} or
-            headers.get('CF-Connecting-IP') or headers.get('X-Preview-Request') != '1' or
+    return not (headers.get('Host') not in {'127.0.0.1:8765', 'localhost:8765'} or
+            headers.get('CF-Connecting-IP') or headers.get(request_header) != '1' or
             headers.get('Sec-Fetch-Site') == 'cross-site' or
-            (headers.get('Origin') and headers.get('Origin') not in origins)):
+            (headers.get('Origin') and headers.get('Origin') not in origins))
+
+
+def history_action(headers, account, manager, method='GET'):
+    if not local_ui_request(headers, 'X-History-Request'):
+        return {'error': 'Sync history from the local dashboard.'}, 403
+    if not account.get('user_id'):
+        return {'error': 'Connect Instagram first.'}, 401
+    try:
+        if method == 'POST':
+            return manager.start(account), 202
+        return manager.status(account['user_id']), 200
+    except Exception:
+        return {'error': 'History storage is unavailable. Try again.'}, 503
+
+
+def preview_action(headers, account, path, method='GET'):
+    if not local_ui_request(headers, 'X-Preview-Request'):
         return {'error': 'Open previews from the local dashboard.'}, 403
     if not account.get('user_id'):
         return {'error': 'Connect Instagram first.'}, 401
@@ -236,6 +252,7 @@ def main():
     args = parser.parse_args()
     monitor = None
     lock = threading.Lock()
+    history_manager = HistorySyncManager(setting)
 
     def stop_monitor():
         if monitor and monitor.poll() is None:
@@ -345,6 +362,9 @@ def main():
                     return self.send_oauth_result(str(error), False, 500)
             if self.path == "/api/events":
                 return self.send_json(read_events(account['user_id']) if account.get('user_id') else [])
+            if path == '/api/history':
+                data, status = history_action(self.headers, account, history_manager)
+                return self.send_json(data, status)
             if path.startswith('/api/previews/'):
                 data, status = preview_action(self.headers, account, path)
                 return self.send_json(data, status)
@@ -376,6 +396,9 @@ def main():
             return self.send_json(data, status)
 
         def do_POST(self):
+            if self.path == '/api/history/sync':
+                data, status = history_action(self.headers, connected_account(), history_manager, 'POST')
+                return self.send_json(data, status)
             if self.path != '/webhooks/instagram':
                 return self.send_json({'error': 'Use Connect Instagram for authentication'}, 404)
             try:

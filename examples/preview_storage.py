@@ -95,6 +95,12 @@ class PreviewStore:
             state = 'expired'
         return {'id': row['id'], 'kind': row['kind'], 'state': state, 'expires_at': row['expires']}
 
+    def find(self, account_id, event_id, index):
+        owner = self.owner(account_id)
+        preview_id = hashlib.sha256(f'{owner}\0{event_id}\0{index}'.encode()).hexdigest()
+        row = self.row(account_id, preview_id)
+        return self.descriptor(row) if row is not None else None
+
     def capture(self, account_id, event_id, index, kind, data):
         if not self.enabled:
             return {'kind': kind, 'state': 'disabled'}

@@ -1,3 +1,6 @@
+# Dashboard runtime only. Python 3.11-3.14; Windows setup installs Python 3.13.
+# FFmpeg, FFprobe and Cloudflare Tunnel are separate executables, not pip packages.
+# start-dashboard.cmd installs/checks them. Node, Azure CLI and gcloud are not required.
 httpx==0.28.1
 Pillow==12.3.0
 azure-storage-blob==12.31.0

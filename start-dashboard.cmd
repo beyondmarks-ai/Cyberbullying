@@ -1,9 +1,9 @@
 @echo off
 cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
-  echo Python environment missing. Follow the installation steps in README.md first.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\setup_windows.ps1" %*
+if errorlevel 1 (
+  echo.
+  echo Setup did not finish. Read the message above and the README troubleshooting section.
   pause
   exit /b 1
 )
-".venv\Scripts\python.exe" tools\launch_dashboard.py %*
-if errorlevel 1 pause

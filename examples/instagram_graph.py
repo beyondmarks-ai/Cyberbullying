@@ -40,11 +40,47 @@ class InstagramGraph:
 
     async def _get(self, path, **params):
         response = await self.http.get(resource_path(path), params=params)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise InstagramGraphError(f'Instagram returned a non-JSON response (HTTP {response.status_code}). Try again.') from None
+        if not isinstance(payload, dict):
+            raise InstagramGraphError('Instagram returned an unexpected response.')
         if response.is_error:
-            error = response.json().get("error", {})
+            error = payload.get("error", {})
+            if not isinstance(error, dict):
+                error = {}
             raise InstagramGraphError(f"Instagram error {error.get('code', response.status_code)}: "
                                       f"{error.get('message', 'Request failed')}".replace(self.token, '[redacted]'))
-        return response.json()
+        return payload
+
+    async def history_pages(self, path, limit, **params):
+        """Bounded cursor pagination; never follow a provider-supplied next URL."""
+        items, ids, cursors = [], set(), set()
+        more = False
+        for _ in range(25):
+            response = await self._get(path, limit=min(50, limit - len(items)), **params)
+            rows = response.get('data', [])
+            if not isinstance(rows, list):
+                raise InstagramGraphError('Instagram returned invalid history data.')
+            # Meta sometimes retains next/after on an empty final messages page.
+            if not rows:
+                more = False
+                break
+            for row in rows:
+                if isinstance(row, dict) and row.get('id') and row['id'] not in ids:
+                    ids.add(row['id'])
+                    items.append(row)
+            paging = response.get('paging', {}) or {}
+            more = bool(paging.get('next'))
+            after = (paging.get('cursors') or {}).get('after')
+            if not more:
+                break
+            if len(items) >= limit or not after or after in cursors:
+                break
+            cursors.add(after)
+            params['after'] = after
+        return items[:limit], more
 
     async def pages(self, path, limit=100, **params):
         items, cursors = [], set()

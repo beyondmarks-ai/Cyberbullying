@@ -30,7 +30,8 @@ Built with Python, Meta's official Instagram API, Azure OpenAI, Gemini, Sarvam, 
 - **Explainable cards:** summaries, severity, model confidence, evidence, language labels, uncertainties, and segment results.
 - **Private previews:** short-lived read-only links, seven-day expiry, Azure lifecycle cleanup, and manual deletion.
 - **Official Instagram login:** account-scoped history, signed webhooks, polling, and token refresh support.
-- **One-command launcher:** starts the dashboard and its matching Cloudflare tunnel, updates local callback settings, and checks the login bridge.
+- **Chat history:** manually import available older conversations, filter by chat, and recover available previews without losing previous AI results.
+- **Double-click Windows setup:** checks/installs Python, FFmpeg and Python packages, opens a local credential form, then starts the dashboard and matching Cloudflare tunnel.
 
 | Card state | Meaning |
 | --- | --- |
@@ -38,14 +39,67 @@ Built with Python, Meta's official Instagram API, Azure OpenAI, Gemini, Sarvam, 
 | Needs review | Meaning, context, coverage, or model agreement is uncertain. |
 | No bullying detected | No abuse identified in the assessed content—not a guarantee that it is harmless. |
 | Analysis unavailable | The content could not be assessed. It is not classified as safe. |
+| Not analyzed | Imported history has no existing AI assessment. Importing it does not run AI or mark it safe. |
 
 The app does **not** automatically delete Instagram messages, hide comments, reply, block users, or report accounts.
 
 ## Install on Windows
 
+### Easiest way: download, extract, double-click
+
+For **Windows 10/11, 64-bit** with an internet connection:
+
+1. [Download the project ZIP](https://github.com/beyondmarks-ai/Cyberbullying/archive/refs/heads/main.zip). Right-click it, choose **Extract All**, and place the folder in Documents. Do not run the app from inside the ZIP.
+2. Open the extracted folder and double-click **`start-dashboard.cmd`**. Keep the window open. Allow several minutes on first use. It checks Python, FFmpeg/FFprobe, and Python packages, installing missing tools using Windows Package Manager (`winget`). Git, Node, Azure CLI, and Google Cloud CLI are **not needed**.
+3. On first use, fill in the **setup form** with credentials from your project administrator or the services listed below. Click **Save and continue**. Secrets are masked in the form and saved only in this PC's ignored `.env` file. The form does not create accounts or verify whether keys work.
+4. The browser opens the dashboard. Expand **Admin setup for comments and messages** and copy its login redirect URL, webhook callback URL, and verify token into Meta as described in [Connect Instagram and webhooks](#connect-instagram-and-webhooks). Enable **messages** and **comments**.
+5. Click **Connect Instagram**, approve access, then send a new DM from another account allowed by your Meta setup. A new card normally appears after the next monitor scan plus AI processing time. The default scan interval is 60 seconds; long videos can take longer.
+
+**After setup:** double-click the same `start-dashboard.cmd` whenever you want to start. It reuses your credentials and checks dependencies. Leave its window open; press **Ctrl+C** there to stop the services it started.
+
+> [!IMPORTANT]
+> This is a one-click **software setup/launcher**, not zero-configuration cloud hosting. You still need authorized Instagram access, cloud resources/API keys, and Meta callback registration. Cloudflare's free temporary URL usually changes when its tunnel restarts, so **update both URLs in Meta whenever they change**. Updating `.env` alone does not update Meta. A stable HTTPS deployment/named tunnel is needed to avoid that recurring step.
+
+### What you or your administrator must provide
+
+| Requirement | Why it is needed |
+| --- | --- |
+| Instagram Professional account + Meta app | Official access to the account's messages/comments. Testers must have the required roles/invitations; public users require the relevant Meta approval/live setup. |
+| Azure OpenAI endpoint, deployment, API key | Text checks and visual-analysis fallback. |
+| Gemini or Vertex Express API key + model | Image, audio, video, and independent text analysis. |
+| Sarvam API key (recommended) | Supplementary speech transcription. |
+| Private Azure storage + key (for previews) | Save images/audio/video for seven days. The administrator must configure privacy and lifecycle cleanup; see the storage section. |
+
+You cannot copy just the project to a different PC and expect cloud credentials, Instagram login, or local history to appear there. Ask your administrator to provide credentials **securely**; never upload `.env`, tokens, or chat history to GitHub. A Meta app's shared webhook configuration also means changing its callback to a second PC can stop deliveries to the first PC. Use one active receiver, or a properly designed shared deployment.
+
+### If setup stops
+
+- **App Installer/winget missing:** install or update [App Installer](https://apps.microsoft.com/detail/9nblggh4nns1) from Microsoft Store, then retry. Company-managed PCs may require IT approval. Manual installation is below.
+- **Windows permission prompt:** review the publisher/package before approving. The script requests Python from `Python.Python.3.13` and media tools from `Gyan.FFmpeg`; their license/source agreements are accepted by the installer command. Do not disable Windows security to run an untrusted download.
+- **Blocked by company policy:** ask IT to approve the local script. The launcher uses a process-only PowerShell execution-policy setting; it does not change your machine's persistent policy or bypass organizational enforcement.
+- **Port 8765 already in use:** no installation/settings changes are made. Open the running dashboard at http://127.0.0.1:8765, or stop its launcher before updating/configuring.
+- **Copied an old `.venv` from another PC:** virtual environments are not portable. Prefer a fresh extracted folder and securely transfer only your configuration; let setup build its own environment.
+- **Network/install failed:** keep the error message, fix connectivity/permissions, and rerun the launcher. Do not post credentials or private logs publicly.
+
+Optional commands from PowerShell inside the project folder:
+
+```powershell
+# Read-only prerequisite/configuration-field check (no installations or key validation)
+.\start-dashboard.cmd -CheckOnly
+# Reopen the local credential form, then launch (stop the existing launcher first)
+.\start-dashboard.cmd -Configure
+# Use an already running external/stable tunnel; do not create a temporary tunnel
+.\start-dashboard.cmd -LocalOnly
+```
+
+`-LocalOnly` requires `IG_REDIRECT_URI` and `IG_WEBHOOK_URL` in `.env` to point to your existing HTTPS tunnel, already registered in Meta. It does not create/configure that tunnel.
+
+<details>
+<summary>Manual installation and credential sources (optional alternative)</summary>
+
 ### 1. Check prerequisites
 
-Install Python **3.11+**, Git, FFmpeg (including **FFprobe**), and a modern browser. Both media tools must be on `PATH`:
+Install Python **3.11–3.14** (3.13 recommended/tested), FFmpeg (including **FFprobe**), and a modern browser. Git is optional if you downloaded the ZIP. Both media tools must be on `PATH`:
 
 ```powershell
 py --version
@@ -110,6 +164,8 @@ Keep the launcher window open. **Ctrl+C** stops the services it started. A busy 
 
 > [!NOTE]
 > The launcher updates local URLs, **not Meta's allowlist or webhook settings**. Complete the Instagram setup below before expecting login or incoming messages to work.
+
+</details>
 
 ## Configuration reference
 
@@ -223,22 +279,34 @@ This command sets the account's management policy: **do not apply it blindly to 
 - Azure lifecycle deletion is asynchronous; physical deletion is **not guaranteed at the exact expiry second**.
 - **Delete preview** removes the cloud media, not the Instagram message, original text, analysis, or event record.
 - Deletion is not recoverable through this dashboard. Already downloaded/browser-held copies cannot be revoked.
-- Old completed events are not automatically backfilled. New/retried events can gain previews; expired Instagram source links cannot be reconstructed.
+- Use **Sync chat history** to recover available older chat attachments and previews on existing post cards. Expired Instagram source links cannot be reconstructed; deleted/expired saved previews are not re-uploaded by sync.
 
 Unchanged polling does not rebuild cards. New cards wait while audio/video is actively playing, so playback is not interrupted.
 
+### Import older chats and previews
+
+1. Open `http://127.0.0.1:8765` on the PC running the dashboard and connect Instagram.
+2. Click **Sync chat history** above the activity grid. Progress shows imported messages, conversations, available previews, and unavailable attachments.
+3. Select a conversation to see its messages with original timestamps, sender names, and sent/received labels. **Messages** includes images, videos, and voice notes sent in chats.
+
+Each manual sync fetches up to **20 conversations, 50 recent messages per conversation, and 200 messages total** through Instagram's API. It can only import content Meta makes available under the connected account's permissions—not a full Instagram inbox export. Repeated syncs update the same message IDs rather than duplicating cards. The newest 500 combined live/imported records are displayed.
+
+Available attachments are copied to private Azure storage with the existing size/type limits and seven-day retention from initial capture. Existing post cards can also recover media from up to 100 recent posts. Source URLs and signed playback links are not persisted in the history file. Cards explain unavailable attachments; a sync cannot recover deleted Instagram content or files Meta no longer serves.
+
+Existing AI assessments are preserved. Other imported messages show **Not analyzed**: history sync makes no AI calls and does not silently mark them safe. Live monitoring continues separately. Imported text/metadata is stored per account on this PC; preview deletion/expiry does not delete that history. The sync endpoint is local-only and allows one active import per account. If interrupted, restart sync; completed imports and captured previews are retained.
+
 ## Update an existing installation
 
-**No need to clone again.** Stop the running launcher with Ctrl+C, then run in the existing repository:
+**No need to clone again if you installed with Git.** Stop the running launcher with Ctrl+C, then run in the existing repository:
 
 ```powershell
 git pull --ff-only
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-notepad .env
 .\start-dashboard.cmd
 ```
 
 If Git reports conflicting local changes, preserve/reconcile them before updating; do not reset or overwrite them blindly.
+
+The launcher installs changed Python requirements and opens the form if required settings are missing. It does **not** silently download new project code. If you installed from ZIP, download the new ZIP into a **new folder**, stop the old app, and securely copy your `.env` into the new folder before launching. To retain local history and preview deletion records, also transfer `tools/accounts` privately; do not share that folder. Do not copy `.venv`. Keep the old folder as a backup until the new installation works.
 
 When migrating from the earlier CLI-based version:
 
@@ -280,7 +348,7 @@ flowchart LR
 
 Azure uses strict structured outputs. Gemini uses a response schema and retries an incomplete result once with a larger output budget. Technical failures remain eligible for retry; completed history is **not automatically re-scored** after a code/model change.
 
-The monitor polls up to 100 recent posts and up to 100 comments per post plus replies. Incoming DMs/comments can arrive through signed webhooks. Echo/outgoing DM webhook events are skipped. The dashboard deduplicates the last 200 stored event records for the active account; it is not a full chat-history client.
+The monitor polls up to 100 recent posts and up to 100 comments per post plus replies. Incoming DMs/comments can arrive through signed webhooks. Echo/outgoing DM webhook events are skipped by live monitoring; manual history sync includes sent messages when Instagram provides them. The dashboard merges imported history with live events by message ID, preserving newer live assessments; it is not a full chat-history client.
 
 ### Accuracy limitations
 
@@ -323,7 +391,7 @@ Instagram content is sent to the configured AI providers and, when enabled, Azur
 | Provider HTTP 404 | Check the Azure deployment name or Google model availability. |
 | Provider HTTP 429 | Check quota/rate limits/billing; pause repeated scans while resolving it. |
 | `No module named azure` | Install updated `requirements.txt` using this project's `.venv` Python. |
-| No preview on an old card | Old completed events were not backfilled. Send a new attachment to test capture. |
+| No preview on an old card | Click **Sync chat history**. Only attachments still provided by Instagram can be recovered; check the card's unavailable/expired explanation. |
 | Preview unavailable | Check storage settings, private container existence, key access, and media format/size. |
 | Preview expired | Seven-day retention may have elapsed. For a five-minute playback-link expiry, try **Reload preview**. |
 | Deletion pending | Retry **Delete preview**; the local record is protected against re-upload while deletion is pending. |
@@ -373,9 +441,11 @@ These use configured credentials and make **billable requests**:
 
 ### Verification snapshot — 2026-10-02
 
-- **52 Python tests passed**, covering ingestion, OAuth, launcher behavior, moderation, preview storage, ownership, expiry, and deletion.
-- DOM checks passed for review states, original text, preview elements, stable polling, and deletion.
+- **72 Python tests passed** on Windows, covering ingestion, OAuth, launcher behavior, moderation, preview storage, ownership, expiry, deletion, history pagination, deduplication, local-only sync access, configuration validation, and installer sequencing.
+- DOM checks passed for review states, original text, preview elements, stable polling, deletion, conversation filtering, unassessed imported messages, and sync progress.
 - Live Azure checks passed for image/video/audio uploads, blocked public access, signed range reads, and deletion. Running-dashboard preview GET/DELETE routes were exercised with synthetic data.
+- Live history sync imported 11 messages from two conversations and restored four image previews; signed reads succeeded. A subsequent real incoming DM reached the webhook and completed analysis.
+- Windows `-CheckOnly` passed on the development PC. Missing-tool/first-install paths were tested with mocks; a clean second-PC installation and GUI interaction have not yet been verified end-to-end. The installer cannot guarantee availability of external package sources, keys, models, or Meta permissions.
 - Live analysis matched **15 of 16 expected smoke-test outcomes**. A victim reporting an insult went to review because the models disagreed, instead of achieving the expected clear result. Earlier runs also varied on sarcasm and a neutral image.
 
 These are functional checks, **not representative accuracy or a guarantee of perfect detection**. Production evaluation needs a consented, labeled dataset across the intended languages/modalities, human reviewers, and separate false-negative/false-positive measurements.
@@ -384,10 +454,14 @@ These are functional checks, **not representative accuracy or a guarantee of per
 
 ```text
 dashboard.py                    Local HTTP server, OAuth, webhooks, preview access
+start-dashboard.cmd             Double-click Windows entry point
+tools/setup_windows.ps1         Prerequisite installation/checks and startup
+tools/setup_config.py           Local first-run credential form
 dashboard/index.html            Preview grid and review interface
 examples/comment_monitor.py     Ingestion, analysis orchestration, preview capture
 examples/azure_moderation.py    Azure/Gemini/Sarvam clients and media preparation
 examples/preview_storage.py     Private Azure blobs and local preview metadata
+examples/history_sync.py        Manual chat import and available-preview backfill
 examples/instagram_graph.py     Official Instagram API client
 examples/instagram_store.py     Account storage and webhook normalization
 tools/launch_dashboard.py       Per-PC dashboard/tunnel startup

@@ -57,6 +57,30 @@ vm.runInContext("filter = 'alert'; render()", context);
 assert.equal(elements.get('#events').children.length, 3);
 console.log('PASS: review/alert filters, legacy results, unavailable state, segment evidence, safe text rendering');
 
+context.fixture = [
+  { ...base, id: 'dm:old', kind: 'image', conversation_id: 'chat-one', conversation_label: '@friend',
+    history_imported: true, direction: 'outgoing', analysis: null,
+    previews: [{ kind: 'image', state: 'unavailable', message: 'Instagram attachment is expired or inaccessible.' }] },
+  { ...base, id: 'dm:other', conversation_id: 'chat-two', history_imported: true },
+  { ...base, id: 'comment:1', kind: 'comment' },
+];
+vm.runInContext("events = fixture; filter = 'dm'; render()", context);
+assert.equal(elements.get('#dms').textContent, 2, 'DM media counts as chat');
+assert.equal(elements.get('#events').children.length, 2);
+assert.match(text(elements.get('#events').children[0]), /Imported history — Not analyzed/);
+assert.match(text(elements.get('#events').children[0]), /Instagram attachment is expired/);
+assert.match(text(elements.get('#events').children[0]), /Sent/);
+vm.runInContext("conversationFilter = 'chat-one'; render()", context);
+assert.equal(elements.get('#events').children.length, 1);
+vm.runInContext("currentUsername = 'test'; showHistory({ state: 'running', messages: 4, conversations_list: [{id: 'chat-one', label: '@friend'}] })", context);
+assert.equal(elements.get('#sync-history').disabled, true);
+assert.match(elements.get('#history-status').textContent, /4 messages/);
+assert.equal(elements.get('#conversation-filter').children.length, 3);
+vm.runInContext("showHistory({ state: 'partial', previews_unavailable: 1, limited: true }); conversationFilter = ''", context);
+assert.equal(elements.get('#sync-history').disabled, false);
+assert.match(elements.get('#history-status').textContent, /Import limit reached/);
+console.log('PASS: conversation filters, DM media counts, unassessed history, unavailable attachments and sync progress');
+
 (async () => {
   const requests = [];
   context.window.confirm = () => true;

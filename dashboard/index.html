@@ -265,6 +265,9 @@
       .preview-item p { font-size: .85rem; overflow-wrap: anywhere; }
       .preview-dialog { width: min(1000px, 92vw); padding: 16px; }
       .preview-dialog img { display: block; max-width: 100%; max-height: 80vh; margin: auto; }
+      .history-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 12px; }
+      .history-controls select { max-width: 100%; padding: 10px; border-radius: 8px; background: #1e293b; color: #f8fafc; border: 1px solid #64748b; }
+      #history-status { margin-bottom: 18px; }
       .analysis-details { margin-top: 12px; overflow-wrap: anywhere; }
       .analysis-details summary { cursor: pointer; }
       .message { max-height: 220px; overflow: auto; }
@@ -464,12 +467,20 @@
             <button data-filter="media" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-media"/></svg>Media</button>
           </div>
         </div>
+        <div class="history-controls">
+          <button id="sync-history" type="button" disabled>Sync chat history</button>
+          <label for="conversation-filter">Conversation</label>
+          <select id="conversation-filter"><option value="">All activity</option><option value="__chats__">All chats</option></select>
+        </div>
+        <p>Sync imports up to 200 recent messages (20 chats, 50 per chat) and saves available attachments to Azure for seven days. Existing assessments stay; other imported messages are not analyzed.</p>
+        <p id="history-status" role="status" aria-live="polite">Connect Instagram to sync older chats.</p>
         <div id="events"><div class="card empty">Waiting for new activity…</div></div>
       </section>
     </main>
     <script>
       let events = [],
         filter = 'all',
+        conversationFilter = '',
         lastAlerts = 0,
         currentUsername = '',
         accountUpdatedAt = null,
@@ -501,6 +512,50 @@
         return svg;
       }
       let renderSignature = '';
+      const syncHistory = document.querySelector('#sync-history'),
+        historyStatus = document.querySelector('#history-status'),
+        conversationSelect = document.querySelector('#conversation-filter');
+      let conversationSignature = '';
+      const isChat = event => event.kind === 'dm' || event.id?.startsWith('dm:');
+      async function historyRequest(method = 'GET') {
+        const response = await fetch(method === 'POST' ? '/api/history/sync' : '/api/history', {
+          method, headers: { 'X-History-Request': '1' }, cache: 'no-store',
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'History sync unavailable');
+        return data;
+      }
+      function showHistory(state) {
+        syncHistory.disabled = !currentUsername || state.state === 'running';
+        syncHistory.textContent = state.state === 'running' ? 'Syncing history…' : 'Sync chat history';
+        const counts = `${state.messages || 0} messages · ${state.conversations || 0} chats · ${state.previews_available || 0} previews available · ${state.previews_unavailable || 0} previews unavailable`;
+        historyStatus.textContent = !currentUsername ? 'Connect Instagram to sync older chats.' :
+          state.message || (state.state === 'idle' ? 'Ready to import available chat history.' :
+            `${state.state === 'running' ? 'Syncing' : state.state === 'partial' ? 'Sync finished with unavailable items' : 'Sync complete'}: ${counts}.`);
+        if (state.limited) historyStatus.textContent += ' Import limit reached; this is not your entire inbox.';
+        if (state.warnings?.length) historyStatus.textContent += ' ' + [...new Set(state.warnings)].join(' ');
+        if (!state.conversations_list && currentUsername) return;
+        const conversations = state.conversations_list || [];
+        const signature = JSON.stringify([currentUsername, conversations]);
+        if (signature !== conversationSignature) {
+          conversationSignature = signature;
+          const options = [['', 'All activity'], ['__chats__', 'All chats'], ...conversations.map(c => [c.id, c.label])];
+          if (!options.some(([id]) => id === conversationFilter)) conversationFilter = '';
+          conversationSelect.replaceChildren();
+          for (const [value, label] of options) {
+            const option = document.createElement('option'); option.value = value; option.textContent = label;
+            conversationSelect.append(option);
+          }
+          conversationSelect.value = conversationFilter;
+        }
+      }
+      syncHistory.addEventListener('click', async () => {
+        syncHistory.disabled = true;
+        historyStatus.textContent = 'Starting history sync…';
+        try { showHistory(await historyRequest('POST')); }
+        catch (error) { historyStatus.textContent = error.message; syncHistory.disabled = !currentUsername; }
+      });
+      conversationSelect.addEventListener('change', () => { conversationFilter = conversationSelect.value; render(); });
       async function previewRequest(id, method = 'GET') {
         const response = await fetch(`/api/previews/${encodeURIComponent(id)}`, {
           method, headers: { 'X-Preview-Request': '1' }, cache: 'no-store',
@@ -533,7 +588,7 @@
           remove.textContent = 'Delete preview';
           async function loadPreview() {
             if (!preview.id) {
-              note.textContent = preview.state === 'disabled' ? 'Preview storage is not configured.' : 'Preview could not be saved.';
+              note.textContent = preview.message || (preview.state === 'disabled' ? 'Preview storage is not configured.' : 'Preview could not be saved.');
               reload.disabled = remove.disabled = true;
               return;
             }
@@ -599,7 +654,7 @@
         body.append(grid);
       }
       function render() {
-        const signature = JSON.stringify([filter, events]);
+        const signature = JSON.stringify([filter, conversationFilter, events]);
         if (signature === renderSignature) return;
         // Do not reset a playing clip when background polling receives new events.
         if ([...document.querySelectorAll('#events video, #events audio')].some(media => !media.paused && !media.ended)) return;
@@ -609,18 +664,20 @@
         const alertCount = events.filter(needsAttention).length;
         total.textContent = events.length;
         comments.textContent = events.filter(e => e.kind === 'comment').length;
-        dms.textContent = events.filter(e => e.kind === 'dm').length;
+        dms.textContent = events.filter(isChat).length;
         alerts.textContent = alertCount;
         if (alertCount > lastAlerts) {
           alertBanner.hidden = false;
           setTimeout(() => (alertBanner.hidden = true), 10000);
         }
         lastAlerts = alertCount;
-        const shown = events.filter(
+        const shown = events.filter(e => !conversationFilter ||
+          (conversationFilter === '__chats__' ? isChat(e) : e.conversation_id === conversationFilter)).filter(
           e =>
             filter === 'all' ||
             (filter === 'alert' && needsAttention(e)) ||
             (filter === 'review' && needsReview(e)) ||
+            (filter === 'dm' && isChat(e)) ||
             (filter === 'media' && ['image', 'video', 'audio'].includes(e.kind)) ||
             e.kind === filter,
         );
@@ -650,7 +707,8 @@
             ? 'Message'
             : event.kind[0].toUpperCase() + event.kind.slice(1);
           badge.append(activityIcon(event.kind), badgeLabel);
-          source.textContent = event.source;
+          source.textContent = event.source + (event.conversation_label ? ` · ${event.conversation_label}` : '') +
+            (event.direction === 'outgoing' ? ' · Sent' : event.direction === 'incoming' ? ' · Received' : '');
           message.className = 'message';
           message.textContent = event.original_text ?? event.text;
           body.append(source, message);
@@ -660,6 +718,12 @@
           detailTitle.textContent = review ? 'Needs review — see analysis' : flagged ? 'Potential bullying — see analysis' : 'View safety analysis';
           details.append(detailTitle);
           body.append(details);
+          if (!event.analysis) {
+            detailTitle.textContent = event.history_imported ? 'Imported history — Not analyzed' : 'Not analyzed';
+            const note = document.createElement('p');
+            note.textContent = 'No safety assessment is available for this message. History sync does not run AI analysis.';
+            details.append(note);
+          }
           if (event.analysis?.content_summary) {
             const summary = document.createElement('p');
             summary.textContent = `Content: ${event.analysis.content_summary}`;
@@ -708,7 +772,7 @@
             }
           }
           time.dateTime = event.time;
-          time.textContent = new Date(event.time).toLocaleString();
+          time.textContent = event.time ? new Date(event.time).toLocaleString() : 'Timestamp unavailable';
           row.append(badge, body, time);
           eventList.append(row);
         }
@@ -744,6 +808,8 @@
               (state.updated_at ? ' Last scan: ' + new Date(state.updated_at).toLocaleString() : '')
             : '';
           render();
+          try { showHistory(currentUsername ? await historyRequest() : { state: 'idle' }); }
+          catch (error) { historyStatus.textContent = error.message; syncHistory.disabled = !currentUsername; }
         } catch {
           status.classList.add('offline');
           status.lastElementChild.textContent = 'Dashboard disconnected';
