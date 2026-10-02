@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
     <title>Instagram Safety Monitor</title>
     <style>
       :root {
@@ -242,14 +243,32 @@
       }
       #events {
         display: grid;
-        gap: 10px;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr));
+        gap: 16px;
       }
       .event {
-        display: grid;
-        grid-template-columns: 150px 1fr auto;
+        display: flex;
+        flex-direction: column;
         gap: 16px;
-        align-items: start;
+        min-width: 0;
       }
+      .event > div { width: 100%; min-width: 0; }
+      .event time { margin-top: auto; }
+      .preview-grid { display: grid; gap: 12px; margin: 14px 0; }
+      .preview-item { border: 1px solid var(--line); border-radius: 12px; padding: 10px; overflow: hidden; }
+      .preview-item img, .preview-item video {
+        width: 100%; max-height: 260px; object-fit: contain; display: block; background: #020617; border-radius: 8px;
+      }
+      .preview-item img { cursor: zoom-in; }
+      .preview-item audio { width: 100%; }
+      .preview-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+      .preview-item p { font-size: .85rem; overflow-wrap: anywhere; }
+      .preview-dialog { width: min(1000px, 92vw); padding: 16px; }
+      .preview-dialog img { display: block; max-width: 100%; max-height: 80vh; margin: auto; }
+      .analysis-details { margin-top: 12px; overflow-wrap: anywhere; }
+      .analysis-details summary { cursor: pointer; }
+      .message { max-height: 220px; overflow: auto; }
+      #events > .empty { grid-column: 1 / -1; }
       .event.alert {
         border: 2px solid var(--red);
         background: #351b27;
@@ -297,6 +316,16 @@
       }
       .alert .analysis {
         color: #fecaca;
+      }
+      .event.review {
+        border-color: #fbbf24;
+      }
+      .badge.review {
+        color: #422006;
+        background: #fbbf24;
+      }
+      .review .analysis {
+        color: #fde68a;
       }
       time,
       .empty {
@@ -378,7 +407,7 @@
       <header>
         <div>
           <h1>Instagram Safety Monitor</h1>
-          <p>Automatic checks for messages, images, and videos up to one minute</p>
+          <p>Sensitive checks for text, images, voice and video. AI can miss abuse or misunderstand context.</p>
         </div>
         <div class="account-controls">
           <span id="account-name" class="account-name"></span
@@ -409,13 +438,13 @@
         <label>Login redirect URL<input id="redirect-url" readonly/></label>
       </details>
       <div id="alert-banner" class="card alert-banner" role="alert" hidden>
-        <strong>Bullying detected.</strong> Review the red activity below.
+        <strong>Activity needs attention.</strong> Check potential bullying and items needing human review below.
       </div>
       <section class="stats" aria-label="Activity summary">
         <div class="card"><span id="total" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-grid"/></svg>Total captured</span></div>
         <div class="card"><span id="comments" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-comment"/></svg>Comments</span></div>
         <div class="card"><span id="dms" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-message"/></svg>Direct messages</span></div>
-        <div class="card"><span id="alerts" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-alert"/></svg>Bullying alerts</span></div>
+        <div class="card"><span id="alerts" class="number">0</span><span class="label"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-alert"/></svg>Alerts / needs review</span></div>
       </section>
       <section aria-labelledby="activity-heading">
         <div class="toolbar">
@@ -426,10 +455,12 @@
           <div class="filters" aria-label="Filter activity">
             <button data-filter="all" aria-pressed="true"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-grid"/></svg>All</button>
             <button data-filter="alert" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-alert"/></svg>Alerts</button>
+            <button data-filter="review" aria-pressed="false">Needs review</button>
             <button data-filter="comment" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-comment"/></svg>Comments</button>
             <button data-filter="dm" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-message"/></svg>Messages</button>
             <button data-filter="image" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-image"/></svg>Images</button>
             <button data-filter="video" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-video"/></svg>Videos</button>
+            <button data-filter="audio" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-audio"/></svg>Voice</button>
             <button data-filter="media" aria-pressed="false"><svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-media"/></svg>Media</button>
           </div>
         </div>
@@ -469,8 +500,113 @@
         svg.append(use);
         return svg;
       }
+      let renderSignature = '';
+      async function previewRequest(id, method = 'GET') {
+        const response = await fetch(`/api/previews/${encodeURIComponent(id)}`, {
+          method, headers: { 'X-Preview-Request': '1' }, cache: 'no-store',
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Preview unavailable');
+        return data;
+      }
+      function addPreviews(body, event) {
+        if (!event.previews?.length) {
+          if (['image', 'video', 'audio'].includes(event.kind)) {
+            const note = document.createElement('p');
+            note.textContent = 'No saved preview for this older or unavailable attachment.';
+            body.append(note);
+          }
+          return;
+        }
+        const grid = document.createElement('div');
+        grid.className = 'preview-grid';
+        for (const preview of event.previews) {
+          const box = document.createElement('div'), holder = document.createElement('div'), note = document.createElement('p');
+          box.className = 'preview-item';
+          note.setAttribute('role', 'status');
+          note.textContent = 'Loading preview…';
+          const actions = document.createElement('div');
+          actions.className = 'preview-actions';
+          const reload = document.createElement('button'), remove = document.createElement('button');
+          reload.type = remove.type = 'button';
+          reload.textContent = 'Reload preview';
+          remove.textContent = 'Delete preview';
+          async function loadPreview() {
+            if (!preview.id) {
+              note.textContent = preview.state === 'disabled' ? 'Preview storage is not configured.' : 'Preview could not be saved.';
+              reload.disabled = remove.disabled = true;
+              return;
+            }
+            reload.disabled = true;
+            try {
+              const info = await previewRequest(preview.id);
+              if (!info.url) {
+                holder.replaceChildren();
+                note.textContent = info.state === 'deleted' ? 'Preview deleted.' :
+                  info.state === 'deleting' ? 'Deletion pending. Try Delete preview again.' :
+                  info.state === 'expired' ? 'Preview expired (seven-day retention).' : 'Preview is not available yet.';
+                remove.disabled = info.state === 'deleted';
+                return;
+              }
+              const media = document.createElement(preview.kind === 'image' ? 'img' : preview.kind === 'video' ? 'video' : 'audio');
+              media.referrerPolicy = 'no-referrer';
+              media.src = info.url;
+              if (preview.kind === 'image') {
+                media.alt = `Image sent by ${event.source}`;
+                media.loading = 'lazy';
+                media.tabIndex = 0;
+                media.setAttribute('role', 'button');
+                const enlarge = async () => {
+                  try {
+                    const fresh = await previewRequest(preview.id);
+                    if (!fresh.url) throw new Error('Preview expired or was deleted.');
+                    const dialog = document.createElement('dialog'), full = document.createElement('img'), close = document.createElement('button');
+                    dialog.className = 'preview-dialog';
+                    full.src = fresh.url; full.alt = media.alt; full.referrerPolicy = 'no-referrer';
+                    close.textContent = 'Close image'; close.type = 'button';
+                    close.addEventListener('click', () => dialog.close());
+                    dialog.addEventListener('close', () => dialog.remove());
+                    dialog.append(close, full); document.body.append(dialog); dialog.showModal();
+                  } catch (error) { note.textContent = error.message; }
+                };
+                media.addEventListener('click', enlarge);
+                media.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); enlarge(); } });
+              } else { media.controls = true; media.preload = 'metadata'; }
+              media.addEventListener('error', () => { note.textContent = 'Preview link expired, or this format cannot play. Try Reload preview.'; });
+              holder.replaceChildren(media);
+              note.textContent = `Available until ${new Date(info.expires_at * 1000).toLocaleString()}.`;
+            } catch (error) { note.textContent = error.message; }
+            finally { reload.disabled = false; }
+          }
+          reload.addEventListener('click', loadPreview);
+          remove.addEventListener('click', async () => {
+            if (!window.confirm('Permanently delete this Azure media preview? The message and analysis will remain.')) return;
+            remove.disabled = true;
+            try {
+              await previewRequest(preview.id, 'DELETE');
+              holder.replaceChildren(); note.textContent = 'Preview deleted.';
+              reload.disabled = true;
+            } catch (error) { note.textContent = error.message; remove.disabled = false; }
+          });
+          actions.append(reload, remove); box.append(holder, note, actions); grid.append(box);
+          if ('IntersectionObserver' in window) {
+            const observer = new IntersectionObserver(entries => {
+              if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); loadPreview(); }
+            });
+            observer.observe(box);
+          } else { loadPreview(); }
+        }
+        body.append(grid);
+      }
       function render() {
-        const alertCount = events.filter(e => e.analysis?.bullying).length;
+        const signature = JSON.stringify([filter, events]);
+        if (signature === renderSignature) return;
+        // Do not reset a playing clip when background polling receives new events.
+        if ([...document.querySelectorAll('#events video, #events audio')].some(media => !media.paused && !media.ended)) return;
+        renderSignature = signature;
+        const needsReview = e => e.analysis?.needs_review || e.analysis?.severity === 'unknown';
+        const needsAttention = e => e.analysis?.bullying || needsReview(e);
+        const alertCount = events.filter(needsAttention).length;
         total.textContent = events.length;
         comments.textContent = events.filter(e => e.kind === 'comment').length;
         dms.textContent = events.filter(e => e.kind === 'dm').length;
@@ -483,7 +619,8 @@
         const shown = events.filter(
           e =>
             filter === 'all' ||
-            (filter === 'alert' && e.analysis?.bullying) ||
+            (filter === 'alert' && needsAttention(e)) ||
+            (filter === 'review' && needsReview(e)) ||
             (filter === 'media' && ['image', 'video', 'audio'].includes(e.kind)) ||
             e.kind === filter,
         );
@@ -497,29 +634,36 @@
         }
         for (const event of shown) {
           const flagged = event.analysis?.bullying,
+            review = needsReview(event),
             row = document.createElement('article'),
             badge = document.createElement('span'),
             body = document.createElement('div'),
             source = document.createElement('strong'),
             message = document.createElement('div'),
             time = document.createElement('time');
-          row.className = `card event${flagged ? ' alert' : ''}`;
-          badge.className = `badge ${flagged ? 'alert' : event.kind}`;
+          row.className = `card event${review ? ' review' : flagged ? ' alert' : ''}`;
+          badge.className = `badge ${review ? 'review' : flagged ? 'alert' : event.kind}`;
           const badgeLabel = document.createElement('span');
-          badgeLabel.textContent = flagged
-            ? 'Bullying detected'
+          badgeLabel.textContent = review ? 'Needs review' : flagged
+            ? 'Potential bullying'
             : event.kind === 'dm'
             ? 'Message'
             : event.kind[0].toUpperCase() + event.kind.slice(1);
           badge.append(activityIcon(event.kind), badgeLabel);
           source.textContent = event.source;
           message.className = 'message';
-          message.textContent = event.text;
+          message.textContent = event.original_text ?? event.text;
           body.append(source, message);
+          addPreviews(body, event);
+          const details = document.createElement('details'), detailTitle = document.createElement('summary');
+          details.className = 'analysis-details';
+          detailTitle.textContent = review ? 'Needs review — see analysis' : flagged ? 'Potential bullying — see analysis' : 'View safety analysis';
+          details.append(detailTitle);
+          body.append(details);
           if (event.analysis?.content_summary) {
             const summary = document.createElement('p');
             summary.textContent = `Content: ${event.analysis.content_summary}`;
-            body.append(summary);
+            details.append(summary);
           }
           if (event.analysis) {
             const analysis = document.createElement('div');
@@ -530,11 +674,37 @@
               : `${flagged ? 'Potential bullying detected' : 'No bullying detected'} · ${event.analysis.severity} severity · ${Math.round(
                   event.analysis.confidence * 100,
                 )}% model confidence · ${event.analysis.reason}`;
-            body.append(analysis);
+            details.append(analysis);
+            if (review && !unavailable) {
+              analysis.textContent = `Needs human review${flagged ? ' - possible bullying' : ''}. ${event.analysis.reason}`;
+            }
+            for (const [label, values] of [
+              ['Languages', event.analysis.languages],
+              ['Evidence', event.analysis.evidence],
+              ['Uncertainties', event.analysis.uncertainties],
+            ]) {
+              if (Array.isArray(values) && values.length) {
+                const detail = document.createElement('p');
+                detail.textContent = `${label}: ${values.join(' | ')}`;
+                details.append(detail);
+              }
+            }
+            if (Array.isArray(event.analysis.segments) && event.analysis.segments.length) {
+              const details = document.createElement('details');
+              const heading = document.createElement('summary');
+              heading.textContent = 'Audio/video segment results';
+              details.append(heading);
+              for (const segment of event.analysis.segments) {
+                const item = document.createElement('p');
+                item.textContent = `${segment.start}-${segment.end}s: ${segment.status} - ${segment.summary}`;
+                details.append(item);
+              }
+              body.append(details);
+            }
             if (event.analysis.coverage) {
               const coverage = document.createElement('p');
               coverage.textContent = event.analysis.coverage;
-              body.append(coverage);
+              details.append(coverage);
             }
           }
           time.dateTime = event.time;

@@ -23,6 +23,7 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT / 'examples'))
 from instagram_store import account_path, write_json, webhook_items
 from instagram_api import GRAPH_ROOT, resource_path
+from preview_storage import PreviewStore
 ENV_FILE = ROOT / ".env"
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 OAUTH_STATES = {}
@@ -198,6 +199,37 @@ def webhook_verify_token():
     return hmac.new(setting('IG_APP_SECRET').encode(), b'instagram-webhook-verify', 'sha256').hexdigest()
 
 
+def preview_action(headers, account, path, method='GET'):
+    # Loopback-only UI, no tunnel access, cross-site reads, DNS rebinding or CSRF.
+    origins = {'http://127.0.0.1:8765', 'http://localhost:8765'}
+    if (headers.get('Host') not in {'127.0.0.1:8765', 'localhost:8765'} or
+            headers.get('CF-Connecting-IP') or headers.get('X-Preview-Request') != '1' or
+            headers.get('Sec-Fetch-Site') == 'cross-site' or
+            (headers.get('Origin') and headers.get('Origin') not in origins)):
+        return {'error': 'Open previews from the local dashboard.'}, 403
+    if not account.get('user_id'):
+        return {'error': 'Connect Instagram first.'}, 401
+    preview_id = path.removeprefix('/api/previews/')
+    if not re.fullmatch(r'[a-f0-9]{64}', preview_id):
+        return {'error': 'Preview not found.'}, 404
+    store = None
+    try:
+        store = PreviewStore(setting)
+        if not store.enabled:
+            return {'error': 'Azure preview storage is not configured.'}, 503
+        if method == 'DELETE':
+            return store.delete(account['user_id'], preview_id), 200
+        return store.link(account['user_id'], preview_id), 200
+    except KeyError:
+        return {'error': 'Preview not found.'}, 404
+    except Exception:
+        # Storage exceptions can contain signed URLs; never return them to the UI.
+        return {'error': 'Preview storage is temporarily unavailable. Try again.'}, 503
+    finally:
+        if store is not None:
+            store.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-browser", action="store_true")
@@ -313,6 +345,9 @@ def main():
                     return self.send_oauth_result(str(error), False, 500)
             if self.path == "/api/events":
                 return self.send_json(read_events(account['user_id']) if account.get('user_id') else [])
+            if path.startswith('/api/previews/'):
+                data, status = preview_action(self.headers, account, path)
+                return self.send_json(data, status)
             if self.path == "/api/status":
                 health = {}
                 token_file = instagram_token_file()
@@ -332,6 +367,13 @@ def main():
                                        'redirect_url': instagram_redirect_uri(),
                                        'verify_token': webhook_verify_token()})
             return super().do_GET()
+
+        def do_DELETE(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if not path.startswith('/api/previews/'):
+                return self.send_json({'error': 'Not found'}, 404)
+            data, status = preview_action(self.headers, connected_account(), path, 'DELETE')
+            return self.send_json(data, status)
 
         def do_POST(self):
             if self.path != '/webhooks/instagram':
@@ -408,6 +450,7 @@ if(result.ok)setTimeout(()=>window.close(),700);}}</script></body></html>'''.enc
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
             self.send_header("Content-Length", str(len(data)))

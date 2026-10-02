@@ -187,7 +187,7 @@ def main():
     python = ROOT / ('.venv/Scripts/python.exe' if os.name == 'nt' else '.venv/bin/python')
     if not python.exists():
         raise RuntimeError('Create the Python environment and install requirements.txt first (see README).')
-    check = subprocess.run([str(python), '-c', 'import httpx; import PIL'], capture_output=True)
+    check = subprocess.run([str(python), '-c', 'import httpx; import PIL; import azure.storage.blob'], capture_output=True)
     if check.returncode:
         raise RuntimeError('Install dependencies with .venv\\Scripts\\python.exe -m pip install -r requirements.txt')
     try:

@@ -6,9 +6,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from azure_moderation import AzureModerator, GeminiVideoModerator, SarvamTranscriber
+from azure_moderation import (AzureModerator, GeminiVideoModerator, SarvamTranscriber,
+                              combine_results, require_review)
 from instagram_graph import InstagramGraph
 from instagram_store import account_path, write_json, ROOT
+from preview_storage import PreviewStore
 
 SESSION_FILE = SEEN_FILE = EVENT_FILE = None
 STATUS_FILE = None
@@ -35,69 +37,120 @@ def account_files(username):
     return folder / f"{account}-session.json", folder / f"{account}-seen.json", folder / f"{account}-events.jsonl"
 
 
-def record_event(kind, source, text, analysis, event_id=None):
+def record_event(kind, source, text, analysis, event_id=None, previews=None, original_text=None):
     event = {"kind": kind, "source": source, "text": text, "analysis": analysis,
-             "time": datetime.now(timezone.utc).isoformat(), "id": event_id}
+             "time": datetime.now(timezone.utc).isoformat(), "id": event_id,
+             "previews": previews or [], "original_text": original_text if original_text is not None else text}
     with EVENT_FILE.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None, event_id=None):
+async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None, event_id=None,
+                   preview_store=None, account_id=None):
+    previews, preview_failed, original_text = [], False, text
     try:
-        images, videos, transcripts, audio_failed = [], [], [], False
-        for url, media_kind in (media or []):
-            data = await moderator.download(url)
+        if not media and not text.strip():
+            raise ValueError('Empty event has no assessable content')
+        images, timed, transcripts, problems = [], [], [], []
+        for index, (url, media_kind) in enumerate(media or []):
+            try:
+                data = await moderator.download(url)
+            except Exception:
+                problems.append('An attachment could not be downloaded.')
+                previews.append({'kind': media_kind, 'state': 'unavailable'})
+                continue
+            if preview_store is not None:
+                try:
+                    previews.append(await asyncio.to_thread(preview_store.capture, account_id, event_id, index, media_kind, data))
+                except (ValueError, OSError):
+                    previews.append({'kind': media_kind, 'state': 'unsupported'})
+                except Exception as error:
+                    previews.append({'kind': media_kind, 'state': 'unavailable'})
+                    preview_failed = True
+                    print(f'Preview storage failed: {type(error).__name__}', file=sys.stderr, flush=True)
+                    SCAN_ERRORS.append('A media preview could not be saved to Azure; it will be retried.')
             if media_kind == "image":
                 images.append(data)
-            elif media_kind == "video":
-                videos.append(data)
-            if media_kind in {"audio", "video"}:
+            elif media_kind in {"audio", "video"}:
+                transcript, speech_failed = '', False
                 try:
                     transcript = await transcriber.transcribe(data)
                     if transcript:
                         transcripts.append(transcript)
                 except Exception as error:
-                    audio_failed = True
-                    print(f"Sarvam transcription failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+                    speech_failed = True
+                    print(f"Speech transcription failed: {type(error).__name__}", file=sys.stderr, flush=True)
+                timed.append((media_kind, data, transcript, speech_failed))
+            else:
+                problems.append('An attachment type is not supported.')
         transcript = " ".join(transcripts)
-        if kind == "audio" and audio_failed and not transcript:
-            raise RuntimeError("Audio could not be transcribed")
         analyzed_text = f"{text}\nSpoken transcript: {transcript}" if transcript else text
-        if videos:
+        results = []
+        for media_kind, data, speech, speech_failed in timed:
             try:
-                results = [await video_moderator.analyze(video, transcript, text, images=images) for video in videos]
-                analysis = max(results, key=lambda result: (result["bullying"],
-                               {'none': 0, 'low': 1, 'medium': 2, 'high': 3}.get(result['severity'], 0),
-                               result["confidence"]))
-            except Exception as error:
-                print(f"Gemini video analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-                for video in videos:
-                    images.extend(await asyncio.to_thread(moderator._video_frames, video))
-                analysis = await moderator.analyze(analyzed_text, images)
-                analysis["reason"] = f"Gemini unavailable; Azure frame fallback used. {analysis['reason']}"
-                analysis['coverage'] = 'Sampled frames only; video moments may be missed.'
-        elif images:
+                method = video_moderator.analyze if media_kind == 'video' else video_moderator.analyze_audio
+                analysis = await method(data, speech, text)
+            except Exception:
+                try:
+                    if media_kind == 'video':
+                        frames = await asyncio.to_thread(moderator._video_frames, data)
+                        analysis = await analyze_image_fallback(moderator, frames, analyzed_text)
+                    elif speech:
+                        analysis = await moderator.analyze(f'{text}\nTranscript: {speech}')
+                    else:
+                        raise ValueError('No readable audio or transcript')
+                    analysis = require_review(analysis, 'Native media analysis unavailable; only sampled frames or a partial transcript were assessed.', retry=True)
+                except Exception:
+                    problems.append(f'A {media_kind} attachment could not be assessed.')
+                    continue
+            if speech_failed:
+                analysis['coverage'] = (analysis.get('coverage', '') +
+                                        ' Separate speech transcription unavailable; native audio was used.').strip()
+            results.append(analysis)
+        if images:
             try:
                 analysis = await video_moderator.analyze_images(images, analyzed_text)
-            except Exception as error:
-                print(f"Gemini image analysis failed: {type(error).__name__}", file=sys.stderr, flush=True)
-                analysis = await moderator.analyze(analyzed_text, images)
-                analysis['reason'] = f"Gemini unavailable; Azure image fallback used. {analysis['reason']}"
-        else:
-            analysis = await moderator.analyze(analyzed_text, images)
-        if audio_failed:
-            analysis['coverage'] = (analysis.get('coverage', '') +
-                                    ' Separate speech transcription unavailable; review audio manually.').strip()
+            except Exception:
+                try:
+                    analysis = await analyze_image_fallback(moderator, images, analyzed_text)
+                    analysis['reason'] = f"Azure image fallback used. {analysis['reason']}"
+                except Exception:
+                    problems.append('Images could not be assessed.')
+                    analysis = None
+            if analysis:
+                results.append(analysis)
+        if not media:
+            if kind in {'image', 'video', 'audio'}:
+                problems.append('The media content was not supplied by Instagram; only its caption is available.')
+            calls = [moderator.analyze(text)]
+            if os.environ.get('MODERATION_TEXT_SECOND_OPINION', 'true').lower() != 'false' and video_moderator is not None:
+                calls.append(video_moderator.analyze_text(text))
+            assessments = await asyncio.gather(*calls, return_exceptions=True)
+            valid = [r for r in assessments if isinstance(r, dict)]
+            analysis = combine_results(valid, second_opinion=True)
+            if len(valid) != len(assessments):
+                analysis = require_review(analysis, 'One text assessment failed; the independent check is incomplete.', retry=True)
+            results.append(analysis)
+        analysis = combine_results(results)
+        for problem in problems:
+            analysis = require_review(analysis, problem, retry=True)
+        if analysis.get('retry_required'):
+            SCAN_ERRORS.append('Some content was only partially assessed and will be retried. See Needs review.')
         text = f"{text}\nTranscript: {transcript}" if transcript else text
     except Exception as error:
         analysis = {"bullying": False, "severity": "unknown", "confidence": 0,
-                    "reason": f"Analysis failed: {type(error).__name__}", "categories": []}
+                    "reason": f"Analysis failed: {type(error).__name__}", "categories": [],
+                    "status": "unavailable", "needs_review": True}
         print(f"AI analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
         SCAN_ERRORS.append('AI analysis failed. Check Azure/Sarvam/Gemini configuration.')
-    record_event(kind, source, text, analysis, event_id)
-    label = 'unavailable' if analysis['severity'] == 'unknown' else ('BULLYING' if analysis['bullying'] else 'safe')
+    record_event(kind, source, text, analysis, event_id, previews, original_text)
+    label = analysis.get('status', 'unavailable')
     print(f"AI {label}: {source} ({analysis['severity']})", flush=True)
-    return analysis["severity"] != "unknown"
+    return analysis["severity"] != "unknown" and not analysis.get('retry_required', False) and not preview_failed
+
+
+async def analyze_image_fallback(moderator, images, text):
+    return combine_results([await moderator.analyze(text, images[i:i + 6]) for i in range(0, len(images), 6)])
 
 
 async def main():
@@ -122,6 +175,7 @@ async def main():
     moderator = AzureModerator()
     transcriber = SarvamTranscriber(moderator.http)
     video_moderator = GeminiVideoModerator(moderator.http)
+    preview_store = PreviewStore()
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
     print(f"Monitoring @{username}'s comments and media every {interval} seconds. Press Ctrl+C to stop.")
 
@@ -135,7 +189,7 @@ async def main():
                 item = json.loads(pending.read_text(encoding='utf-8'))
                 if item['id'] not in seen:
                     if await moderate(moderator, transcriber, video_moderator, item['kind'], item['source'],
-                                      item['text'], item['media'], item['id']):
+                                      item['text'], item['media'], item['id'], preview_store, token_data['user_id']):
                         seen.add(item['id'])
                 if item['id'] in seen:
                     write_json(SEEN_FILE, sorted(seen))
@@ -147,7 +201,7 @@ async def main():
                     assets = [(p['media_url'], 'video' if p.get('media_type') == 'VIDEO' else 'image')
                               for p in parts if p.get('media_url')]
                     kind = 'video' if any(k == 'video' for _, k in assets) else 'image'
-                    analyzed = await moderate(moderator, transcriber, video_moderator, kind, f"post {media['id']}", media.get("caption", "Post media"), assets, media_id)
+                    analyzed = await moderate(moderator, transcriber, video_moderator, kind, f"post {media['id']}", media.get("caption", "Post media"), assets, media_id, preview_store, token_data['user_id'])
                     if analyzed:
                         seen.add(media_id)
                 comments = await client.comments(media["id"], 100)
@@ -162,7 +216,7 @@ async def main():
                     if comment_id not in seen:
                         author = comment.get("username") or (comment.get("from") or {}).get("username") or "unknown"
                         print(f"NEW [post {media['id']}] @{author}: {comment.get('text', '')}", flush=True)
-                        analyzed = await moderate(moderator, transcriber, video_moderator, "comment", f"@{author} · post {media['id']}", comment.get("text", ""), event_id=comment_id)
+                        analyzed = await moderate(moderator, transcriber, video_moderator, "comment", f"@{author} · post {media['id']}", comment.get("text", ""), event_id=comment_id, preview_store=preview_store, account_id=token_data['user_id'])
                         if analyzed:
                             seen.add(comment_id)
             # ponytail: unbounded test-account history; prune when this file becomes materially large.
@@ -175,6 +229,7 @@ async def main():
         if '--once' in sys.argv:
             await client.close()
             await moderator.http.aclose()
+            preview_store.close()
             return
         await asyncio.sleep(interval)
 
