@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Classroom IP test — voluntary participation</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font: 16px/1.6 system-ui, sans-serif;
+        color: #f8fafc;
+        background: #0f172a;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      main {
+        max-width: 600px;
+        margin: 32px auto;
+        padding: 24px;
+      }
+      h1 {
+        font-size: 1.8rem;
+        line-height: 1.2;
+      }
+      p {
+        color: #cbd5e1;
+      }
+      .card {
+        padding: 24px;
+        background: #1b2336;
+        border: 1px solid #52627a;
+        border-radius: 16px;
+      }
+      .tag {
+        color: #7dd3fc;
+        font-weight: 700;
+      }
+      label {
+        display: block;
+        margin: 20px 0 8px;
+      }
+      input[type='text'] {
+        width: 100%;
+        padding: 12px;
+        font: inherit;
+        background: #0f172a;
+        color: #fff;
+        border: 1px solid #94a3b8;
+        border-radius: 8px;
+      }
+      .consent {
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+      }
+      input[type='checkbox'] {
+        width: 24px;
+        height: 24px;
+        flex-shrink: 0;
+        margin-top: 4px;
+      }
+      button {
+        min-height: 48px;
+        padding: 10px 18px;
+        font: inherit;
+        border: 1px solid #38bdf8;
+        border-radius: 8px;
+        background: #075985;
+        color: #fff;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      :focus-visible {
+        outline: 3px solid #7dd3fc;
+        outline-offset: 3px;
+      }
+      #result {
+        overflow-wrap: anywhere;
+        white-space: pre-line;
+      }
+      #tracking-state {
+        font-weight: 700;
+        color: #7dd3fc;
+      }
+      #stop {
+        margin-top: 12px;
+        background: #7f1d1d;
+        border-color: #f87171;
+      }
+      .error {
+        color: #fecaca;
+      }
+      @media (max-width: 480px) {
+        main {
+          margin: 0;
+          padding: 16px;
+        }
+        .card {
+          padding: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="tag">Voluntary classroom test</span>
+      <h1>See the IP used to visit this page</h1>
+      <p>
+        This exercise shows what a website can observe when you connect to it. It does not obtain your IP from an
+        Instagram message.
+      </p>
+      <div class="card">
+        <p>
+          After you agree, this page checks your connection every 15 seconds while visible, for up to one hour. Your
+          instructor sees your initial IP and any changed IP, your entered username and the time. The username is not
+          verified with Instagram. No password or location is requested.
+        </p>
+        <p>
+          On classroom Wi-Fi, this may be your phone's local IP. Public IPs may be shared or belong to a VPN. Records
+          are kept for up to 24 hours while the dashboard is running, and the instructor can clear them sooner.
+        </p>
+        <form id="test-form">
+          <label for="test-username">Your test username (no @)</label>
+          <input
+            id="test-username"
+            type="text"
+            maxlength="30"
+            pattern="[A-Za-z0-9._]{1,30}"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+          />
+          <label class="consent"
+            ><input id="consent" type="checkbox" required /><span
+              >I agree to periodic connection checks and saving my initial IP and IP changes with my entered username
+              and the time, until I stop, close this page, or one hour passes.</span
+            ></label
+          >
+          <button id="submit" type="submit" disabled>Agree and start automatic checks</button>
+        </form>
+        <p id="tracking-state" role="status" aria-live="polite">Automatic checks are off.</p>
+        <button id="stop" type="button" hidden>Stop automatic checks</button>
+        <p>
+          Checks pause when this page is hidden or your phone suspends it. Changing networks works only if the server is
+          still reachable. This local classroom link usually cannot be reached on mobile data.
+        </p>
+        <p>You can close this page to decline. Opening it alone does not save a test record.</p>
+        <p id="result" role="status" aria-live="polite"></p>
+      </div>
+    </main>
+    <script>
+      const token = location.hash.slice(1),
+        form = document.querySelector('#test-form'),
+        consent = document.querySelector('#consent'),
+        button = document.querySelector('#submit'),
+        result = document.querySelector('#result'),
+        state = document.querySelector('#tracking-state'),
+        stopButton = document.querySelector('#stop'),
+        username = document.querySelector('#test-username');
+      let session = null,
+        timer = null,
+        expiryTimer = null,
+        controller = null,
+        startController = null,
+        starting = false,
+        inFlight = false,
+        lifecycle = 0;
+      form.reset();
+      if (!token) result.textContent = 'Open the complete test link provided by your instructor.';
+      consent.addEventListener('change', () => {
+        button.disabled = !consent.checked || !token || !!session || starting;
+      });
+      async function post(path, body, signal) {
+        const response = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal,
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          const error = new Error(data.error || 'Request failed.');
+          error.status = response.status;
+          throw error;
+        }
+        return data;
+      }
+      function stopTracking(message = 'Automatic checks stopped.') {
+        const previous = session;
+        session = null;
+        lifecycle++;
+        startController?.abort();
+        clearTimeout(timer);
+        clearTimeout(expiryTimer);
+        controller?.abort();
+        consent.disabled = false;
+        consent.checked = false;
+        username.disabled = false;
+        button.disabled = true;
+        button.textContent = 'Agree and start automatic checks';
+        stopButton.hidden = true;
+        state.textContent = message;
+        if (previous)
+          fetch('/api/stop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: previous.id }),
+            keepalive: true,
+          }).catch(() => {});
+      }
+      async function checkConnection() {
+        if (!session || inFlight) return;
+        clearTimeout(timer);
+        if (performance.now() >= session.expires) {
+          stopTracking('One-hour test ended. Automatic checks are off.');
+          return;
+        }
+        if (document.hidden) {
+          state.textContent = 'Automatic checks paused while this page is hidden.';
+          return;
+        }
+        const current = session;
+        inFlight = true;
+        controller = new AbortController();
+        const timeout = setTimeout(() => controller?.abort(), 8000);
+        try {
+          const data = await post('/api/check', { session_id: current.id }, controller.signal);
+          if (session !== current) return;
+          state.textContent = document.hidden
+            ? 'Automatic checks paused while this page is hidden.'
+            : `Automatic checks active · last checked ${new Date(data.checked_at).toLocaleTimeString()}`;
+          result.className = '';
+          result.textContent = `${data.changed ? 'New IP saved' : 'Current connection'}: ${data.ip}\n${
+            data.address_type
+          }\nObserved on this test page. Instagram DM IP remains unknown.`;
+        } catch (error) {
+          if (session !== current) return;
+          if (error.status === 403) {
+            stopTracking(error.message);
+            return;
+          }
+          state.textContent = 'Server unreachable. Retrying while this page is visible; no new IP has been confirmed.';
+        } finally {
+          clearTimeout(timeout);
+          inFlight = false;
+          controller = null;
+          if (session === current && !document.hidden) timer = setTimeout(checkConnection, current.interval);
+        }
+      }
+      stopButton.addEventListener('click', () => stopTracking());
+      document.addEventListener('visibilitychange', () => {
+        if (!session) return;
+        if (document.hidden) {
+          clearTimeout(timer);
+          state.textContent = 'Automatic checks paused while this page is hidden.';
+        } else checkConnection();
+      });
+      window.addEventListener('online', () => {
+        if (session) checkConnection();
+      });
+      window.addEventListener('pagehide', () => stopTracking());
+      form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (!consent.checked || session || starting) return;
+        starting = true;
+        button.disabled = true;
+        result.className = '';
+        result.textContent = 'Starting…';
+        const attempt = ++lifecycle;
+        startController = new AbortController();
+        const timeout = setTimeout(() => startController?.abort(), 10000);
+        try {
+          const data = await post(
+            '/api/submit',
+            { username: username.value.trim(), consent: true, consent_version: 'classroom-ip-v2', token },
+            startController.signal,
+          );
+          if (attempt !== lifecycle) {
+            post('/api/stop', { session_id: data.session_id }).catch(() => {});
+            return;
+          }
+          session = {
+            id: data.session_id,
+            expires: performance.now() + data.expires_in_seconds * 1000,
+            interval: data.check_seconds * 1000,
+          };
+          consent.disabled = true;
+          username.disabled = true;
+          button.textContent = 'Automatic checks started';
+          stopButton.hidden = false;
+          result.textContent = `Saved: ${data.ip}\n${data.address_type}\nObserved on this test page. Instagram DM IP remains unknown.`;
+          state.textContent = document.hidden
+            ? 'Automatic checks paused while this page is hidden.'
+            : 'Automatic checks active · checking every 15 seconds.';
+          expiryTimer = setTimeout(
+            () => stopTracking('One-hour test ended. Automatic checks are off.'),
+            data.expires_in_seconds * 1000,
+          );
+          timer = setTimeout(checkConnection, session.interval);
+        } catch (error) {
+          if (attempt === lifecycle) {
+            result.className = 'error';
+            result.textContent = error.message || 'Could not connect. Try again.';
+          }
+        } finally {
+          clearTimeout(timeout);
+          startController = null;
+          starting = false;
+          button.disabled = !!session || !consent.checked || !token;
+        }
+      });
+    </script>
+  </body>
+</html>

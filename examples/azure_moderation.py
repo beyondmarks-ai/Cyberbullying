@@ -3,25 +3,78 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import httpx
+import imageio_ffmpeg
 from PIL import Image
 
 
-SYSTEM_PROMPT = """You are a safety classifier. Detect targeted bullying, harassment, humiliation,
-threats, hate, or sexual harassment in the supplied Instagram text and visual content. Do not flag
-neutral discussion, friendly teasing, criticism without abuse, or content merely documenting bullying.
-Return JSON only with: bullying (boolean), confidence (0 to 1), severity (none, low, medium, high),
-reason (one brief plain-language sentence), and categories (array of short labels)."""
+SYSTEM_PROMPT = """You are a multilingual cyberbullying safety classifier. Analyze meaning and context
+in every language and script, including Kannada, Hindi, English, Hinglish, romanized Indian languages,
+and code-mixed text such as Kannada-English. Recognize regional slang, phonetic spelling, emojis,
+deliberate misspellings, censored profanity, and words split with punctuation or spaces. Do not rely on
+an English translation alone: identify the target, intent, conversational context, and culturally specific
+meaning. Detect targeted bullying, harassment, humiliation, threats, hate, or sexual harassment in the
+supplied Instagram text and visual content. Do not flag neutral discussion, friendly teasing, criticism
+without abuse, counterspeech, or content merely documenting bullying. Return JSON only with: bullying
+(boolean), confidence (0 to 1), severity (none, low, medium, high), reason (one precise plain-language
+sentence), categories (array of short labels), languages (array of detected language names), target
+(the person or group targeted, or an empty string), and evidence (array of short exact quotes or actions)."""
 
 VIDEO_PROMPT = """Analyze this complete Instagram video for cyberbullying. Consider spoken words,
 on-screen text, gestures, threats, targeted humiliation, hate, sexual harassment, and the interaction
-between audio and visuals. Distinguish bullying from friendly teasing, neutral criticism, reporting,
-education, or counterspeech. Return the same JSON fields defined by the safety classifier."""
+between audio and visuals in any language, including code-mixed and romanized speech. Distinguish
+bullying from friendly teasing, neutral criticism, reporting, education, or counterspeech. In evidence,
+include timestamps when possible and quote the exact spoken or on-screen words that justify the result.
+Explain exactly what behavior is bullying and who is targeted. Return the same JSON fields defined by
+the safety classifier."""
+
+EXPLICIT_ABUSE_PATTERNS = [
+    (r"तेरी\s+म(?:ाँ|ां|ा)\s+की\s+चू[तद]", "family-targeted sexual abuse"),
+    (r"\bteri\s+maa?\s+ki\s+ch(?:u|oo)t\b", "family-targeted sexual abuse"),
+    (r"(?:मादरचोद|बहनचोद|भोसड़ी(?:के)?|चूतिया)", "explicit Hindi abuse"),
+    (r"\b(?:madarchod|motherchod|behenchod|bhenchod|bhosdike|chutiya)\b", "explicit Hinglish abuse"),
+    (r"(?:ನಿನ್ನ\s+ಅಮ್ಮನ|ನಿನ್\s+ಅವ್ವನ್|ಸೂಳೆ\s*ಮಗ|ಬೋಳಿ\s*ಮಗ)", "family-targeted Kannada abuse"),
+    (r"\b(?:ninn?a?\s+(?:amman|avvan)|sule\s*maga|boli\s*maga)\b", "romanized Kannada abuse"),
+    (r"\b(?:fuck\s+you|kill\s+yourself)\b", "explicit targeted English abuse"),
+]
+
+
+def prepare_text(value):
+    """Normalize Unicode while preserving every language's native script."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return "".join(character for character in text if character not in {"\u200b", "\u200c", "\u200d", "\ufeff"})
+
+
+def ffmpeg_executable():
+    """Use system FFmpeg when present, otherwise the project-local binary."""
+    return shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def enforce_explicit_abuse(analysis, text):
+    """High-recall backstop for unambiguous targeted abuse the model may miss."""
+    normalized = prepare_text(text).casefold()
+    for pattern, label in EXPLICIT_ABUSE_PATTERNS:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        result = dict(analysis)
+        result.update({
+            "bullying": True,
+            "confidence": max(float(result.get("confidence", 0)), 0.99),
+            "severity": "high",
+            "reason": f"Explicit {label} directly targets a person or their family.",
+        })
+        result["categories"] = list(dict.fromkeys([*result.get("categories", []), "harassment", label]))[:5]
+        result["evidence"] = list(dict.fromkeys([match.group(0), *result.get("evidence", [])]))[:5]
+        return result
+    return analysis
 
 
 def normalize(result):
@@ -33,12 +86,17 @@ def normalize(result):
     except (TypeError, ValueError):
         confidence = 0.0
     categories = result.get("categories", [])
+    languages = result.get("languages", [])
+    evidence = result.get("evidence", [])
     return {
         "bullying": result.get("bullying") is True,
         "confidence": confidence,
         "severity": severity,
         "reason": str(result.get("reason", "No explanation returned."))[:300],
         "categories": [str(item)[:50] for item in categories[:5]] if isinstance(categories, list) else [],
+        "languages": [str(item)[:40] for item in languages[:5]] if isinstance(languages, list) else [],
+        "target": str(result.get("target", ""))[:100],
+        "evidence": [str(item)[:200] for item in evidence[:5]] if isinstance(evidence, list) else [],
     }
 
 
@@ -69,6 +127,7 @@ class AzureModerator:
         return self.key
 
     async def analyze(self, text="", images=None):
+        text = prepare_text(text)
         if not self.endpoint:
             raise RuntimeError("Set AZURE_OPENAI_ENDPOINT")
         content = [{"type": "text", "text": text or "Analyze the supplied visual content."}]
@@ -79,10 +138,12 @@ class AzureModerator:
             f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions",
             params={"api-version": "2024-10-21"}, headers={"api-key": await asyncio.to_thread(self._get_key)},
             json={"messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}],
-                  "response_format": {"type": "json_object"}, "temperature": 0, "max_tokens": 250},
+                  "response_format": {"type": "json_object"}, "temperature": 0, "max_completion_tokens": 250},
         )
         response.raise_for_status()
-        return normalize(json.loads(response.json()["choices"][0]["message"]["content"]))
+        return enforce_explicit_abuse(
+            normalize(json.loads(response.json()["choices"][0]["message"]["content"])), text
+        )
 
     @staticmethod
     def _prepare_image(data):
@@ -104,9 +165,7 @@ class AzureModerator:
 
     @staticmethod
     def _video_frames(data):
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg is required to analyze video frames")
+        ffmpeg = ffmpeg_executable()
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "video.mp4"
             source.write_bytes(data)
@@ -140,9 +199,7 @@ class SarvamTranscriber:
 
     @staticmethod
     def _audio_chunks(media):
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg is required to analyze audio")
+        ffmpeg = ffmpeg_executable()
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "media"
             source.write_bytes(media)
@@ -194,18 +251,17 @@ class GeminiVideoModerator:
                     {"inlineData": {"mimeType": "video/mp4", "data": base64.b64encode(video).decode()}},
                     {"text": prompt},
                 ]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 300, "responseMimeType": "application/json"},
+                "generationConfig": {"temperature": 0, "maxOutputTokens": 800, "responseMimeType": "application/json"},
             },
         )
         response.raise_for_status()
         parts = response.json()["candidates"][0]["content"]["parts"]
-        return normalize(json.loads("".join(part.get("text", "") for part in parts if not part.get("thought"))))
+        analysis = normalize(json.loads("".join(part.get("text", "") for part in parts if not part.get("thought"))))
+        return enforce_explicit_abuse(analysis, f"{context}\n{transcript}")
 
     @staticmethod
     def _prepare_video(video):
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            raise RuntimeError("ffmpeg is required to prepare videos")
+        ffmpeg = ffmpeg_executable()
         with tempfile.TemporaryDirectory() as folder:
             source, output = Path(folder) / "source", Path(folder) / "video.mp4"
             source.write_bytes(video)
@@ -224,15 +280,16 @@ class GeminiVideoModerator:
 if __name__ == "__main__":
     assert normalize({"bullying": True, "confidence": "1.2", "severity": "HIGH", "categories": ["threat"]}) == {
         "bullying": True, "confidence": 1.0, "severity": "high", "reason": "No explanation returned.",
-        "categories": ["threat"],
+        "categories": ["threat"], "languages": [], "target": "", "evidence": [],
     }
+    assert prepare_text("ನೀ\u200bನು useless") == "ನೀನು useless"
     with tempfile.TemporaryDirectory() as folder:
         audio = Path(folder) / "test.wav"
-        subprocess.run([shutil.which("ffmpeg"), "-loglevel", "error", "-f", "lavfi", "-i",
+        subprocess.run([ffmpeg_executable(), "-loglevel", "error", "-f", "lavfi", "-i",
                         "sine=frequency=440:duration=1", "-y", str(audio)], check=True)
         assert len(SarvamTranscriber._audio_chunks(audio.read_bytes())) == 1
         video = Path(folder) / "test.mp4"
-        subprocess.run([shutil.which("ffmpeg"), "-loglevel", "error", "-f", "lavfi", "-i",
+        subprocess.run([ffmpeg_executable(), "-loglevel", "error", "-f", "lavfi", "-i",
                         "color=c=blue:s=320x240:d=1", "-pix_fmt", "yuv420p", "-y", str(video)], check=True)
         assert GeminiVideoModerator._prepare_video(video.read_bytes())
     print("Self-test passed")
