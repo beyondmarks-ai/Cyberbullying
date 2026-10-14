@@ -6,8 +6,15 @@ Student usernames are self-reported, not authenticated Instagram identities.
 
 ## Run with phones
 
+`start-student-test.cmd` runs the Windows setup and normal dashboard/tunnel
+launcher with IP sharing enabled (`start-dashboard.cmd -StudentTest`).
+Connect Instagram through its official OAuth flow. Credentials and tokens stay
+local. The IP-sharing page is served separately from the OAuth tunnel.
+For an IP-only check, Instagram login and the media-analysis providers are not required.
+
 1. Stop the existing dashboard with Ctrl+C, then run `start-student-test.cmd`.
-   To test without connecting to Instagram, run `start-student-test.cmd --no-monitor`.
+   To test without connecting to Instagram, run `start-student-test.cmd --no-monitor`
+   after installing the Python requirements. This mode does not start a tunnel.
 2. Open `http://127.0.0.1:8765` on this computer. Expand **IP sharing settings**
    to see the phone links. Each launch generates a new link.
 3. Connect the phones and this computer to the same Wi-Fi. Copy a phone link

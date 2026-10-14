@@ -24,9 +24,11 @@
   }
 
   function senderUsername(event) {
+    if (event.direction === 'outgoing') return null;
     const source = event.source || '';
     if (
       !['dm', 'comment'].includes(event.kind) &&
+      !String(event.id || '').startsWith('dm:') &&
       !(['image', 'audio', 'video'].includes(event.kind) && source.includes('direct message'))
     )
       return null;

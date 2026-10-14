@@ -20,3 +20,5 @@ tools/seen-comments.json
 tools/monitor-events.jsonl
 tools/accounts/
 tools/student-test/
+.runtime/
+.env.*.tmp

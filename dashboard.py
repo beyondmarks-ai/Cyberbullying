@@ -1,232 +1,512 @@
 import argparse
 import hashlib
+import hmac
+import time
+from http.cookies import SimpleCookie
+import html
 import json
 import os
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import threading
-import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from student_test import VisitStore, start_collector
 
 ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT / 'examples'))
+from instagram_store import account_path, write_json, webhook_items
+from instagram_api import GRAPH_ROOT, resource_path
+from preview_storage import PreviewStore
+from history_sync import HistorySyncManager, read_history, read_live_events
+from sender_profiles import enrich_sender, load_profiles
+from student_test import VisitStore, start_collector
 ENV_FILE = ROOT / ".env"
 USERNAME = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+OAUTH_STATES = {}
+OAUTH_TICKETS = {}
+OAUTH_SCOPES = ",".join((
+    "instagram_business_basic",
+    "instagram_business_manage_comments",
+    "instagram_business_manage_messages",
+))
 
 
-def login_error(output):
-    """Translate aiograpi failures without exposing its traceback to the browser."""
-    message = output.lower()
-    if "needs_upgrade" in message or "out of date" in message:
-        return "The Instagram client is out of date. Reinstall the Python requirements and try again."
-    if "challenge" in message or "checkpoint" in message:
-        return "Instagram requires a security check. Complete it in the Instagram app, then try again."
-    if "two_factor" in message or "two-factor" in message:
-        return "Instagram requires two-factor authentication; complete the login in the Instagram app first."
-    if "bad_password" in message or "incorrect password" in message:
-        return "Instagram says the password is incorrect."
-    if "connectproxyerror" in message or "connecterror" in message or "timed out" in message:
-        return "Could not reach Instagram. Check the internet or proxy connection and try again."
-    if "rate limit" in message or "please wait" in message:
-        return "Instagram temporarily limited login attempts. Wait a while, then try again."
-    return "Instagram could not verify this login. Check the Instagram app for a security prompt and try again."
-
-
-def credentials():
-    values = {}
+def setting(name, default=""):
+    if name in os.environ:
+        return os.environ[name]
     if ENV_FILE.exists():
         for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             key, separator, value = line.partition("=")
-            if separator and not key.lstrip().startswith("#"):
-                values[key.strip()] = value.strip().strip("'\"")
-    return values.get("IG_USERNAME", ""), values.get("IG_PASSWORD", "")
+            if separator and key.strip() == name:
+                return value.strip().strip("'\"")
+    return default
 
 
-def event_file(username):
-    account = hashlib.sha256(username.lower().encode()).hexdigest()[:12]
-    return ROOT / "tools/accounts" / f"{account}-events.jsonl"
+def instagram_token_file():
+    files = sorted((ROOT / "tools/accounts").glob("*-instagram.json"), key=lambda path: path.stat().st_mtime)
+    return files[-1] if files else None
 
 
-def monitor_log_file(username):
-    account = hashlib.sha256(username.lower().encode()).hexdigest()[:12]
-    return ROOT / "tools/accounts" / f"{account}-monitor.log"
+def connected_account():
+    path = instagram_token_file()
+    return json.loads(path.read_text(encoding='utf-8')) if path else {}
 
 
-def monitor_error(username):
-    path = monitor_log_file(username)
-    output = path.read_text(encoding="utf-8", errors="replace")[-20000:].lower() if path.exists() else ""
-    if "challenge_required" in output or "challengerequired" in output or "checkpoint" in output:
-        return "Instagram security check required"
-    if "login_required" in output or "loginrequired" in output:
-        return "Instagram session expired; reconnect account"
-    if "needs_upgrade" in output or "out of date" in output:
-        return "Instagram client update required"
-    if "bad_password" in output or "incorrect password" in output:
-        return "Instagram rejected the password"
-    if "connectproxyerror" in output or "connecterror" in output:
-        return "Cannot connect to Instagram"
-    return "Monitor stopped" if output else None
+def read_events(account_id):
+    latest = read_history(account_id).get('events', {})
+    for event_id, live in read_live_events(account_id).items():
+        history = latest.get(event_id, {})
+        merged = {**live, **history}
+        # Live moderation may finish after import. Never replace it with stale results.
+        if live.get('analysis') is not None:
+            merged['analysis'] = live['analysis']
+        if live.get('previews'):
+            merged['previews'] = live['previews']
+        latest[event_id] = merged
+    profiles = load_profiles(account_path(account_id, 'profiles.json'))
+    return [enrich_sender(event, profiles) for event in
+            sorted(latest.values(), key=lambda e: e.get('time', ''), reverse=True)[:500]]
 
 
-def read_events(username):
-    path = event_file(username)
-    if not path.exists():
-        return []
-    profile_path = path.with_name(path.name.replace("-events.jsonl", "-profiles.json"))
+def instagram_redirect_uri():
+    return setting("IG_REDIRECT_URI", "http://127.0.0.1:8765/auth/instagram/callback")
+
+
+def instagram_oauth_url(state):
+    app_id = setting("IG_APP_ID")
+    if not app_id:
+        raise ValueError("Set IG_APP_ID in .env")
+    return "https://www.instagram.com/oauth/authorize?" + urllib.parse.urlencode({
+        "client_id": app_id,
+        "redirect_uri": instagram_redirect_uri(),
+        "response_type": "code",
+        "enable_fb_login": "false",
+        "force_reauth": "true",
+        "scope": OAUTH_SCOPES,
+        "state": state,
+    })
+
+
+def instagram_request(request, stage, sensitive=()):
+    """Keep Meta's diagnostic details without exposing credentials or request URLs."""
     try:
-        profiles = json.loads(profile_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        profiles = {}
-    events = []
-    for line in path.read_text(encoding="utf-8").splitlines()[-200:]:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        payload = {}
         try:
-            event = json.loads(line)
-            sender = event.get("sender")
-            source = event.get("source", "")
-            # Older events stored the numeric sender ID as an @handle.
-            legacy = re.match(r"^@(\d+)(?=\s|$)", source) if (
-                event.get("kind") == "dm" or "direct message" in source
-            ) else None
-            sender_id = str(sender.get("id") or "") if sender else legacy.group(1) if legacy else ""
-            profile = profiles.get(sender_id)
-            if profile:
-                event["sender"] = profile
-                label = f"@{profile['username']}"
-                event["source"] = label + (" · direct message" if event.get("kind") != "dm" else "")
-            elif legacy:
-                event["source"] = source.replace(legacy.group(0), f"Username unavailable (ID: {sender_id})", 1)
-            events.append(event)
-        except json.JSONDecodeError:
-            pass
-    return list(reversed(events))
+            payload = json.loads(error.read())
+            if not isinstance(payload, dict):
+                payload = {}
+            detail = payload.get('error', payload)
+            if not isinstance(detail, dict):
+                detail = {}
+        except (ValueError, TypeError):
+            detail = {}
+        message = str(detail.get('message') or detail.get('error_message') or
+                      payload.get('error_message', ''))
+        message = message or 'Meta returned an error without a JSON explanation.'
+        for value in (*sensitive, setting('IG_APP_SECRET')):
+            if value:
+                for variant in (str(value), urllib.parse.quote(str(value), safe='')):
+                    message = message.replace(variant, '[redacted]')
+        diagnostic = {'stage': stage, 'http_status': error.code,
+                      'message': message, 'code': detail.get('code', detail.get('error_code')),
+                      'trace_id': detail.get('fbtrace_id'), 'time': time.time()}
+        write_json(ROOT / 'tools/accounts/oauth-error.json', diagnostic)
+        suffix = f" (Meta code {diagnostic['code']})" if diagnostic['code'] is not None else ''
+        raise ValueError(f"{stage} failed (HTTP {error.code}){suffix}: {message}") from None
+    except urllib.error.URLError:
+        raise ValueError(f'{stage} failed: could not reach Instagram. Please try again.') from None
 
 
-def save_credentials(username, password):
-    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.exists() else []
-    replacements = {"IG_USERNAME": username, "IG_PASSWORD": password}
-    output, found = [], set()
-    for line in lines:
-        key, separator, _ = line.partition("=")
-        key = key.strip()
-        if separator and key in replacements:
-            output.append(f"{key}={replacements[key]}")
-            found.add(key)
-        else:
-            output.append(line)
-    output.extend(f"{key}={value}" for key, value in replacements.items() if key not in found)
-    temporary = ENV_FILE.with_suffix(".tmp")
-    temporary.write_text("\n".join(output) + "\n", encoding="utf-8")
-    temporary.replace(ENV_FILE)
+def instagram_token(code):
+    app_id = setting("IG_APP_ID")
+    app_secret = setting("IG_APP_SECRET")
+    if not app_id or not app_secret:
+        raise ValueError("Set IG_APP_ID and IG_APP_SECRET in .env")
+    body = urllib.parse.urlencode({
+        "client_id": app_id,
+        "client_secret": app_secret,
+        "grant_type": "authorization_code",
+        "redirect_uri": instagram_redirect_uri(),
+        "code": code,
+    }).encode()
+    request = urllib.request.Request("https://api.instagram.com/oauth/access_token", data=body, method="POST")
+    result = instagram_request(request, 'Instagram authorization code exchange', (code,))
+    if not isinstance(result, dict) or not isinstance(result.get('access_token'), str) or not result['access_token']:
+        raise ValueError('Instagram authorization returned no usable access token.')
+    permissions = result.get('permissions')
+    if isinstance(permissions, str):
+        permissions = permissions.replace(',', ' ').split()
+    elif not isinstance(permissions, list):
+        permissions = None
+    # Retain only known scope names and booleans, never tokens or response bodies.
+    granted = sorted({p for p in (permissions or ()) if isinstance(p, str)} & set(OAUTH_SCOPES.split(',')))
+    write_json(ROOT / 'tools/accounts/oauth-permissions.json', {
+        'received_at': time.time(), 'has_token': True,
+        'has_account_id': bool(result.get('user_id')),
+        'permissions_reported': permissions is not None,
+        'granted_requested_permissions': granted,
+    })
+    if permissions is not None and 'instagram_business_basic' not in granted:
+        raise ValueError('Instagram did not grant basic account access. Sign in to the intended professional account and approve access.')
+    return result
+
+
+def long_lived_instagram_token(token_data):
+    app_secret = setting("IG_APP_SECRET")
+    query = urllib.parse.urlencode({
+        "grant_type": "ig_exchange_token",
+        "client_secret": app_secret,
+        "access_token": token_data["access_token"],
+    })
+    request = urllib.request.Request(f"https://graph.instagram.com/access_token?{query}")
+    try:
+        long_lived = instagram_request(request, 'Instagram long-lived token exchange', (token_data['access_token'],))
+    except ValueError as error:
+        if "unsupported request - method type: get" in str(error).lower():
+            return {
+                **token_data,
+                "expires_at": time.time() + token_data.get("expires_in", 3600),
+                "temporary_token": True,
+                "token_warning": "Meta issued a short-lived token but refused long-lived conversion. Reconnect when it expires.",
+            }
+        raise
+    return {**token_data, **long_lived, "expires_at": time.time() + long_lived["expires_in"],
+            "temporary_token": False}
+
+
+def save_instagram_token(token_data):
+    query = urllib.parse.urlencode({'fields': 'user_id,username',
+                                    'access_token': token_data['access_token']})
+    request = urllib.request.Request(f'{GRAPH_ROOT}{resource_path("me")}?{query}')
+    profile = instagram_request(request, 'Instagram profile lookup', (token_data['access_token'],))
+    if not profile.get('username') or not profile.get('user_id'):
+        raise ValueError('Instagram profile lookup returned no professional account ID or username.')
+    token_data['user_id'] = str(profile['user_id'])
+    token_data['username'] = profile['username']
+    path = account_path(token_data['user_id'], 'instagram.json')
+    write_json(path, token_data)
+    return path
+
+
+def webhook_verify_token():
+    return hmac.new(setting('IG_APP_SECRET').encode(), b'instagram-webhook-verify', 'sha256').hexdigest()
+
+
+def local_ui_request(headers, request_header):
+    # Loopback-only UI, no tunnel access, cross-site reads, DNS rebinding or CSRF.
+    origins = {'http://127.0.0.1:8765', 'http://localhost:8765'}
+    return not (headers.get('Host') not in {'127.0.0.1:8765', 'localhost:8765'} or
+            headers.get('CF-Connecting-IP') or headers.get(request_header) != '1' or
+            headers.get('Sec-Fetch-Site') == 'cross-site' or
+            (headers.get('Origin') and headers.get('Origin') not in origins))
+
+
+def history_action(headers, account, manager, method='GET'):
+    if not local_ui_request(headers, 'X-History-Request'):
+        return {'error': 'Sync history from the local dashboard.'}, 403
+    if not account.get('user_id'):
+        return {'error': 'Connect Instagram first.'}, 401
+    try:
+        if method == 'POST':
+            return manager.start(account), 202
+        return manager.status(account['user_id']), 200
+    except Exception:
+        return {'error': 'History storage is unavailable. Try again.'}, 503
+
+
+def preview_action(headers, account, path, method='GET'):
+    if not local_ui_request(headers, 'X-Preview-Request'):
+        return {'error': 'Open previews from the local dashboard.'}, 403
+    if not account.get('user_id'):
+        return {'error': 'Connect Instagram first.'}, 401
+    preview_id = path.removeprefix('/api/previews/')
+    if not re.fullmatch(r'[a-f0-9]{64}', preview_id):
+        return {'error': 'Preview not found.'}, 404
+    store = None
+    try:
+        store = PreviewStore(setting)
+        if not store.enabled:
+            return {'error': 'Azure preview storage is not configured.'}, 503
+        if method == 'DELETE':
+            return store.delete(account['user_id'], preview_id), 200
+        return store.link(account['user_id'], preview_id), 200
+    except KeyError:
+        return {'error': 'Preview not found.'}, 404
+    except Exception:
+        # Storage exceptions can contain signed URLs; never return them to the UI.
+        return {'error': 'Preview storage is temporarily unavailable. Try again.'}, 503
+    finally:
+        if store is not None:
+            store.close()
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--student-test", action="store_true", help="Enable the consent page for phones on port 8766")
-    parser.add_argument("--no-monitor", action="store_true", help="Run the dashboard without connecting to Instagram")
-    parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--student-test-port", type=int, default=8766)
+    parser.add_argument('--student-test', action='store_true', help='Enable the consent page for phones')
+    parser.add_argument('--no-monitor', action='store_true', help='Run without connecting to Instagram')
+    parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--student-test-port', type=int, default=8766)
     args = parser.parse_args()
     monitor = None
     lock = threading.Lock()
-    visits = VisitStore(ROOT / "tools/student-test/visits.json")
+    history_manager = HistorySyncManager(setting)
+    visits = VisitStore(ROOT / 'tools/student-test/visits.json')
     collector = None
-    collector_info = {"enabled": False, "phone_urls": []}
+    collector_info = {'enabled': False, 'phone_urls': []}
 
-    def start_monitor():
-        nonlocal monitor
+    def stop_monitor():
         if monitor and monitor.poll() is None:
-            monitor.terminate()
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/PID', str(monitor.pid), '/T', '/F'], capture_output=True)
+            else:
+                monitor.terminate()
             try:
                 monitor.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 monitor.kill()
-        username, password = credentials()
-        if not username or not password:
+
+    def start_monitor():
+        nonlocal monitor
+        stop_monitor()
+        if args.no_monitor:
+            monitor = None
+            return
+        token_file = instagram_token_file()
+        if not token_file:
             monitor = None
             return
         environment = os.environ.copy()
-        environment.update({"IG_USERNAME": username, "IG_PASSWORD": password})
-        log_path = monitor_log_file(username)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8") as output:
-            monitor = subprocess.Popen([sys.executable, ROOT / "examples/comment_monitor.py"], cwd=ROOT,
-                                       env=environment, stdout=output, stderr=subprocess.STDOUT)
+        environment["IG_TOKEN_FILE"] = str(token_file)
+        monitor = subprocess.Popen([sys.executable, ROOT / "examples/comment_monitor.py"], cwd=ROOT, env=environment)
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *handler_args, **kwargs):
             super().__init__(*handler_args, directory=ROOT / "dashboard", **kwargs)
 
         def do_GET(self):
-            if self.path == "/api/student-test":
+            account = connected_account()
+            username = account.get('username', '')
+            path = urllib.parse.urlsplit(self.path).path
+            if self.headers.get('CF-Connecting-IP') and path not in {'/auth/instagram/start', '/auth/instagram/callback', '/webhooks/instagram'}:
+                return self.send_html('Open the dashboard locally at http://127.0.0.1:8765', 403)
+            if path == '/api/student-test':
                 if not self.local_test_request():
-                    return self.send_json({"error": "Open the dashboard on this computer"}, 403)
-                return self.send_json({**collector_info, "visits": visits.read()})
-            username, _ = credentials()
+                    return self.send_json({'error': 'Open the dashboard on this computer'}, 403)
+                return self.send_json({**collector_info, 'visits': visits.read()})
+            if path == '/webhooks/instagram':
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                if query.get('hub.mode') == ['subscribe'] and secrets.compare_digest(query.get('hub.verify_token', [''])[0], webhook_verify_token()):
+                    data = query.get('hub.challenge', [''])[0].encode()
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                return self.send_html('Webhook verification failed', 403)
+            if path == "/auth/instagram/start":
+                redirect = urllib.parse.urlsplit(instagram_redirect_uri())
+                if redirect.scheme != 'https' or not redirect.netloc:
+                    return self.send_html('Configure an HTTPS Instagram redirect URL.', 503)
+                if self.headers.get('Host', '') != redirect.netloc:
+                    if self.headers.get('CF-Connecting-IP'):
+                        return self.send_html(
+                            'Open http://127.0.0.1:8765 on the PC running the dashboard, then click Connect Instagram. '
+                            'The public tunnel URL is only for Instagram callbacks and webhooks.', 403)
+                    ticket = secrets.token_urlsafe(32)
+                    with lock:
+                        for key, expiry in list(OAUTH_TICKETS.items()):
+                            if expiry < time.time():
+                                del OAUTH_TICKETS[key]
+                        OAUTH_TICKETS[ticket] = time.time()+120
+                    self.send_response(302)
+                    self.send_header('Location', f'{redirect.scheme}://{redirect.netloc}/auth/instagram/start?ticket={ticket}')
+                    self.end_headers()
+                    return
+                ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('ticket', [''])[0]
+                with lock:
+                    expiry = OAUTH_TICKETS.pop(ticket, 0)
+                if expiry < time.time():
+                    return self.send_html('Start Instagram login from the local dashboard.', 403)
+                try:
+                    state = secrets.token_urlsafe(32)
+                    with lock:
+                        for key, value in list(OAUTH_STATES.items()):
+                            if value[0] < time.time():
+                                del OAUTH_STATES[key]
+                        OAUTH_STATES[state] = (time.time()+600, instagram_redirect_uri())
+                    location = instagram_oauth_url(state)
+                    self.send_response(302)
+                    self.send_header('Set-Cookie', f'ig_oauth_state={state}; HttpOnly; SameSite=Lax; Path=/auth/instagram; Max-Age=600; Secure')
+                    self.send_header("Location", location)
+                    self.end_headers()
+                except ValueError as error:
+                    self.send_html(str(error), 500)
+                return
+            if path == "/auth/instagram/callback":
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                state = query.get('state', [''])[0]
+                cookie = SimpleCookie()
+                cookie.load(self.headers.get('Cookie', ''))
+                browser_state = cookie.get('ig_oauth_state')
+                if not browser_state or not secrets.compare_digest(state, browser_state.value):
+                    return self.send_html('Invalid Instagram OAuth state. Start login again.', 400)
+                with lock:
+                    saved = OAUTH_STATES.pop(state, None)
+                if not saved or saved[0] < time.time() or saved[1] != instagram_redirect_uri():
+                    return self.send_oauth_result('Login expired or redirect changed. Please try again.', False, 400)
+                if query.get("error"):
+                    return self.send_oauth_result(query.get("error_description", query["error"])[0], False, 400)
+                try:
+                    code = query.get("code", [""])[0]
+                    if not code:
+                        return self.send_oauth_result("Instagram did not return an authorization code.", False, 400)
+                    token_data = long_lived_instagram_token(instagram_token(code))
+                    path = save_instagram_token(token_data)
+                    with lock:
+                        start_monitor()
+                    return self.send_oauth_result("Your account is ready. The dashboard will update automatically.")
+                except (ValueError, KeyError, urllib.error.HTTPError, urllib.error.URLError) as error:
+                    return self.send_oauth_result(str(error), False, 500)
             if self.path == "/api/events":
-                return self.send_json(read_events(username) if username else [])
+                return self.send_json(read_events(account['user_id']) if account.get('user_id') else [])
+            if path == '/api/history':
+                data, status = history_action(self.headers, account, history_manager)
+                return self.send_json(data, status)
+            if path.startswith('/api/previews/'):
+                data, status = preview_action(self.headers, account, path)
+                return self.send_json(data, status)
             if self.path == "/api/status":
-                returncode = monitor.poll() if monitor is not None else None
-                return self.send_json({"running": monitor is not None and returncode is None, "username": username,
+                health = {}
+                token_file = instagram_token_file()
+                if account.get('user_id'):
+                    health_path = account_path(account['user_id'], 'status.json')
+                    if health_path.exists():
+                        health = json.loads(health_path.read_text(encoding='utf-8'))
+                return self.send_json({**health,
+                                       "running": monitor is not None and monitor.poll() is None,
                                        "monitorEnabled": not args.no_monitor,
-                                       "workerPid": monitor.pid if monitor is not None else None,
-                                       "exitCode": returncode,
-                                       "error": monitor_error(username) if username and returncode is not None else None})
+                                       "username": username,
+                                       "auth_warning": account.get("token_warning", ""),
+                                       "account_updated_at": token_file.stat().st_mtime if token_file else None})
             if self.path == "/api/account":
                 return self.send_json({"username": username})
+            if self.path == '/api/setup':
+                return self.send_json({'callback_url': setting('IG_WEBHOOK_URL'),
+                                       'redirect_url': instagram_redirect_uri(),
+                                       'verify_token': webhook_verify_token()})
             return super().do_GET()
 
-        def do_POST(self):
-            if self.path == "/api/student-test/clear":
-                if not self.local_test_request(require_origin=True):
-                    return self.send_json({"error": "Clear records from the local dashboard"}, 403)
-                visits.clear()
-                return self.send_json({"cleared": True})
-            if self.path != "/api/account":
-                return self.send_json({"error": "Not found"}, 404)
-            if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-                return self.send_json({"error": "JSON is required"}, 415)
-            length = int(self.headers.get("Content-Length", 0))
-            if length < 1 or length > 8192:
-                return self.send_json({"error": "Invalid request size"}, 400)
-            try:
-                body = json.loads(self.rfile.read(length))
-                username, password = str(body.get("username", "")).strip(), str(body.get("password", ""))
-            except (json.JSONDecodeError, AttributeError):
-                return self.send_json({"error": "Invalid request"}, 400)
-            if not USERNAME.fullmatch(username) or not password or len(password) > 200 or "\n" in password or "\r" in password:
-                return self.send_json({"error": "Enter a valid Instagram username and password"}, 400)
+        def do_DELETE(self):
+            path = urllib.parse.urlsplit(self.path).path
+            if not path.startswith('/api/previews/'):
+                return self.send_json({'error': 'Not found'}, 404)
+            data, status = preview_action(self.headers, connected_account(), path, 'DELETE')
+            return self.send_json(data, status)
 
-            environment = os.environ.copy()
-            environment.update({"IG_USERNAME": username, "IG_PASSWORD": password})
+        def do_POST(self):
+            if self.path == '/api/student-test/clear':
+                if not self.local_test_request(require_origin=True):
+                    return self.send_json({'error': 'Clear records from the local dashboard'}, 403)
+                visits.clear()
+                return self.send_json({'cleared': True})
+            if self.path == '/api/history/sync':
+                data, status = history_action(self.headers, connected_account(), history_manager, 'POST')
+                return self.send_json(data, status)
+            if self.path != '/webhooks/instagram':
+                return self.send_json({'error': 'Use Connect Instagram for authentication'}, 404)
             try:
-                result = subprocess.run([sys.executable, ROOT / "examples/comment_monitor.py", "--login-test"],
-                                        cwd=ROOT, env=environment, capture_output=True, text=True, timeout=90)
-            except subprocess.TimeoutExpired:
-                return self.send_json({"error": "Instagram login timed out. Try again."}, 504)
-            if result.returncode:
-                return self.send_json({"error": login_error(result.stdout + "\n" + result.stderr)}, 401)
-            with lock:
-                save_credentials(username, password)
-                if not args.no_monitor:
-                    start_monitor()
-            return self.send_json({"username": username, "running": not args.no_monitor})
+                length = int(self.headers.get('Content-Length', '0'))
+            except ValueError:
+                return self.send_json({'error': 'Invalid size'}, 400)
+            if not 0 < length <= 1024*1024:
+                return self.send_json({'error': 'Invalid size'}, 413)
+            body = self.rfile.read(length)
+            def webhook_status(outcome, **details):
+                write_json(ROOT / 'tools/accounts/webhook-status.json',
+                           {'received_at': time.time(), 'outcome': outcome, **details})
+            signature = 'sha256='+hmac.new(setting('IG_APP_SECRET').encode(), body, 'sha256').hexdigest()
+            if not setting('IG_APP_SECRET') or not hmac.compare_digest(signature, self.headers.get('X-Hub-Signature-256', '')):
+                webhook_status('invalid_signature')
+                return self.send_json({'error': 'Invalid signature'}, 403)
+            try:
+                payload = json.loads(body)
+                if payload.get('object') != 'instagram':
+                    return self.send_json({'error': 'Invalid object'}, 400)
+                items = list(webhook_items(payload))
+                queued = 0
+                for account_id, item in items:
+                    if not account_path(account_id, 'instagram.json').exists():
+                        continue
+                    filename = hashlib.sha256(item['id'].encode()).hexdigest()+'.json'
+                    write_json(account_path(account_id, 'inbox') / filename, item)
+                    queued += 1
+                webhook_status('accepted', parsed=len(items), queued=queued,
+                               unmatched=len(items)-queued)
+            except (ValueError, TypeError, AttributeError, KeyError):
+                webhook_status('invalid_payload')
+                return self.send_json({'error': 'Invalid payload'}, 400)
+            return self.send_json({'received': True})
 
         def local_test_request(self, require_origin=False):
-            hosts = {f"127.0.0.1:{server.server_port}", f"localhost:{server.server_port}"}
-            origin = self.headers.get("Origin")
-            return self.headers.get("Host") in hosts and (
-                (not origin and not require_origin) or origin in {f"http://{host}" for host in hosts}
-            )
+            hosts = {f'127.0.0.1:{server.server_port}', f'localhost:{server.server_port}'}
+            origin = self.headers.get('Origin')
+            return (self.headers.get('Host') in hosts and not self.headers.get('CF-Connecting-IP')
+                    and self.headers.get('Sec-Fetch-Site') != 'cross-site' and (
+                        (not origin and not require_origin) or origin in {f'http://{host}' for host in hosts}))
 
         def send_json(self, body, status=200):
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_html(self, message, status=200):
+            data = f"<h1>{html.escape(message)}</h1>".encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_oauth_result(self, message, success=True, status=200):
+            result = json.dumps({
+                'type': 'instagram-oauth',
+                'ok': success,
+                'message': message,
+            }).replace('<', '\\u003c')
+            title = 'Instagram connected' if success else 'Instagram connection failed'
+            data = f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<title>{title}</title><style>
+body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0f172a;color:#f8fafc;
+font:16px/1.5 system-ui,sans-serif}}main{{width:min(420px,calc(100% - 32px));text-align:center}}
+.icon{{font-size:3rem}}p{{color:#b0bdd0}}
+</style></head><body><main><div class="icon">{'✓' if success else '!'}</div>
+<h1>{title}</h1><p>{html.escape(message)}</p><p>You can close this window.</p></main>
+<script>const result={result};if(window.opener){{window.opener.postMessage(result,'http://127.0.0.1:8765');
+if(result.ok)setTimeout(()=>window.close(),700);}}</script></body></html>'''.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -242,24 +522,25 @@ def main():
                 visits.read()
                 self.next_cleanup = time.monotonic() + 60
 
-    server = DashboardServer(("127.0.0.1", args.port), Handler)
+    server = DashboardServer(("127.0.0.1", args.port), Handler, bind_and_activate=False)
+    server.allow_reuse_address = False
+    if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    server.server_bind()
+    server.server_activate()
     try:
         if args.student_test:
             collector, collector_info = start_collector(visits, args.student_test_port)
-        if not args.no_monitor:
-            start_monitor()
-        dashboard_url = f"http://127.0.0.1:{server.server_port}"
-        print(f"Dashboard: {dashboard_url}", flush=True)
-        if args.student_test:
-            print("Student test links are available in the local dashboard.", flush=True)
+        start_monitor()
+        dashboard_url = f'http://127.0.0.1:{server.server_port}'
+        print(f'Dashboard: {dashboard_url}', flush=True)
         if not args.no_browser:
             webbrowser.open(dashboard_url)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        if monitor and monitor.poll() is None:
-            monitor.terminate()
+        stop_monitor()
         if collector:
             collector.shutdown()
             collector.server_close()
@@ -269,9 +550,6 @@ def main():
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         assert USERNAME.fullmatch("valid.user_1") and not USERNAME.fullmatch("invalid user")
-        assert "out of date" in login_error("error_type: needs_upgrade")
-        assert "password" in login_error("bad_password")
-        assert "proxy" in login_error("ConnectProxyError")
         print("Self-test passed")
     else:
         main()

@@ -1,6 +1,8 @@
 const assert = require('assert');
 const { latestByUsername, senderUsername } = require('../dashboard/ip-sharing');
 const now = Date.parse('2026-10-14T12:00:00Z');
+assert.equal(senderUsername({ kind: 'video', id: 'dm:123', source: '@Alice' }), 'alice');
+assert.equal(senderUsername({ kind: 'dm', source: '@Alice', direction: 'outgoing' }), null);
 const visit = (username, ip, age = 1000, extra = {}) => ({
   username,
   ip,

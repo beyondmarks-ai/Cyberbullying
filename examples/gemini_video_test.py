@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -8,7 +9,7 @@ from pathlib import Path
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
-from azure_moderation import GeminiVideoModerator, ffmpeg_executable
+from azure_moderation import GeminiVideoModerator
 from comment_monitor import load_dotenv
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,7 +34,7 @@ async def main():
         image_path, video_path = folder / "frame.png", folder / "test.mp4"
         frame.save(image_path)
         subprocess.run(
-            [ffmpeg_executable(), "-loglevel", "error", "-loop", "1", "-i", str(image_path),
+            [shutil.which('ffmpeg') or 'ffmpeg', "-loglevel", "error", "-loop", "1", "-i", str(image_path),
              "-t", "3", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-y", str(video_path)],
             check=True,
         )

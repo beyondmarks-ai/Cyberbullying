@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "delete-instagram-previews-after-seven-days",
+      "type": "Lifecycle",
+      "definition": {
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "prefixMatch": ["instagram-previews/"]
+        },
+        "actions": {
+          "baseBlob": {"delete": {"daysAfterCreationGreaterThan": 7}}
+        }
+      }
+    }
+  ]
+}

@@ -3,33 +3,27 @@ import hashlib
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from aiograpi import Client
-from aiograpi.exceptions import ChallengeRequired, LoginRequired
-from azure_moderation import AzureModerator, GeminiVideoModerator, SarvamTranscriber, enforce_explicit_abuse
+from azure_moderation import (AzureModerator, GeminiVideoModerator, SarvamTranscriber,
+                              combine_results, require_review)
+from instagram_graph import InstagramGraph
+from instagram_store import account_path, write_json, ROOT
+from preview_storage import PreviewStore
+from sender_profiles import SenderProfiles, sender_label
 
 SESSION_FILE = SEEN_FILE = EVENT_FILE = None
-
-for stream in (sys.stdout, sys.stderr):
-    if hasattr(stream, "reconfigure"):
-        stream.reconfigure(encoding="utf-8", errors="replace")
-
-
-class MonitorClient(Client):
-    async def login_flow(self):
-        """Skip unrelated feed warm-ups that can trigger Instagram checkpoints."""
-        return True
+STATUS_FILE = None
+SCAN_ERRORS = []
 
 
 def load_dotenv():
-    for line in Path(".env").read_text(encoding="utf-8").splitlines():
+    for line in (ROOT / '.env').read_text(encoding="utf-8").splitlines():
         key, separator, value = line.partition("=")
         if separator and not key.lstrip().startswith("#"):
-            # This application's local configuration must win over stale global
-            # provider variables inherited from the launching shell.
+            # This local monitor uses the project's explicit provider configuration;
+            # inherited credentials/endpoints from other projects must not replace it.
             os.environ[key.strip()] = value.strip().strip("'\"")
 
 
@@ -44,242 +38,208 @@ def account_files(username):
     return folder / f"{account}-session.json", folder / f"{account}-seen.json", folder / f"{account}-events.jsonl"
 
 
-class SenderProfiles:
-    """Resolve DM senders without repeating profile requests on every message."""
-
-    def __init__(self, path):
-        self.path = path
-        try:
-            self.profiles = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            self.profiles = {}
-        self.retry_after = {}
-
-    def remember(self, user):
-        user_id = str(getattr(user, "pk", "") or "")
-        username = getattr(user, "username", None)
-        if not user_id or not username:
-            return
-        profile = {"id": user_id, "username": username,
-                   "full_name": getattr(user, "full_name", "") or ""}
-        if self.profiles.get(user_id) != profile:
-            self.profiles[user_id] = profile
-            temporary = self.path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.profiles, ensure_ascii=False), encoding="utf-8")
-            temporary.replace(self.path)
-
-    async def resolve(self, client, user_id):
-        user_id = str(user_id or "")
-        if user_id and user_id not in self.profiles and time.monotonic() >= self.retry_after.get(user_id, 0):
-            self.retry_after[user_id] = time.monotonic() + 300
-            try:
-                profile = await client.user_info_v1(user_id)
-                if str(profile.pk) == user_id:
-                    self.remember(profile)
-            except (ChallengeRequired, LoginRequired):
-                raise
-            except Exception as error:
-                print(f"Sender profile unavailable: {type(error).__name__}", file=sys.stderr, flush=True)
-        return self.profiles.get(user_id, {"id": user_id or None, "username": None, "full_name": ""})
-
-
-def sender_label(sender):
-    if sender.get("username"):
-        return f"@{sender['username']}"
-    return f"Username unavailable (ID: {sender['id']})" if sender.get("id") else "Unknown sender"
-
-
-def record_event(kind, source, text, analysis, sender=None):
+def record_event(kind, source, text, analysis, event_id=None, previews=None, original_text=None, sender=None):
     event = {"kind": kind, "source": source, "text": text, "analysis": analysis,
-             "time": datetime.now(timezone.utc).isoformat()}
+             "time": datetime.now(timezone.utc).isoformat(), "id": event_id,
+             "previews": previews or [], "original_text": original_text if original_text is not None else text}
     if sender is not None:
-        event["sender"] = sender
+        event['sender'] = sender
     with EVENT_FILE.open("a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")
 
 
-def media_urls(media):
-    items = media.resources or [media]
-    return [(str(item.video_url), "video") if item.video_url else (str(item.thumbnail_url), "image")
-            for item in items if item.video_url or item.thumbnail_url]
-
-
-def message_media(message):
-    for item in (message.media, message.media_share, message.clip):
-        if item:
-            if getattr(item, "audio_url", None):
-                return str(item.audio_url), "audio"
-            if getattr(item, "video_url", None):
-                return str(item.video_url), "video"
-            if getattr(item, "thumbnail_url", None):
-                return str(item.thumbnail_url), "image"
-    visual = getattr(message.visual_media, "media", None)
-    if visual:
-        if visual.video_versions:
-            return str(visual.video_versions[0].url), "video"
-        if visual.image_versions2 and visual.image_versions2.candidates:
-            return str(visual.image_versions2.candidates[0].url), "image"
-    return None, None
-
-
-async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None, sender=None):
-    failed = False
+async def moderate(moderator, transcriber, video_moderator, kind, source, text, media=None, event_id=None,
+                   preview_store=None, account_id=None, sender=None):
+    previews, preview_failed, original_text = [], False, text
     try:
-        images, videos, transcripts, audio_failed = [], [], [], False
-        for url, media_kind in (media or []):
-            data = await moderator.download(url)
+        if not media and not text.strip():
+            raise ValueError('Empty event has no assessable content')
+        images, timed, transcripts, problems = [], [], [], []
+        for index, (url, media_kind) in enumerate(media or []):
+            try:
+                data = await moderator.download(url)
+            except Exception:
+                problems.append('An attachment could not be downloaded.')
+                previews.append({'kind': media_kind, 'state': 'unavailable'})
+                continue
+            if preview_store is not None:
+                try:
+                    previews.append(await asyncio.to_thread(preview_store.capture, account_id, event_id, index, media_kind, data))
+                except (ValueError, OSError):
+                    previews.append({'kind': media_kind, 'state': 'unsupported'})
+                except Exception as error:
+                    previews.append({'kind': media_kind, 'state': 'unavailable'})
+                    preview_failed = True
+                    print(f'Preview storage failed: {type(error).__name__}', file=sys.stderr, flush=True)
+                    SCAN_ERRORS.append('A media preview could not be saved to Azure; it will be retried.')
             if media_kind == "image":
                 images.append(data)
-            elif media_kind == "video":
-                videos.append(data)
-            if media_kind in {"audio", "video"}:
+            elif media_kind in {"audio", "video"}:
+                transcript, speech_failed = '', False
                 try:
                     transcript = await transcriber.transcribe(data)
                     if transcript:
                         transcripts.append(transcript)
                 except Exception as error:
-                    audio_failed = True
-                    print(f"Sarvam transcription failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+                    speech_failed = True
+                    print(f"Speech transcription failed: {type(error).__name__}", file=sys.stderr, flush=True)
+                timed.append((media_kind, data, transcript, speech_failed))
+            else:
+                problems.append('An attachment type is not supported.')
         transcript = " ".join(transcripts)
-        if kind == "audio" and audio_failed and not transcript:
-            raise RuntimeError("Audio could not be transcribed")
         analyzed_text = f"{text}\nSpoken transcript: {transcript}" if transcript else text
-        if videos:
+        results = []
+        for media_kind, data, speech, speech_failed in timed:
             try:
-                results = [await video_moderator.analyze(video, transcript, text) for video in videos]
-                analysis = max(results, key=lambda result: (result["bullying"], result["confidence"]))
-            except Exception as error:
-                print(f"Gemini video analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-                for video in videos:
-                    images.extend(await asyncio.to_thread(moderator._video_frames, video))
-                analysis = await moderator.analyze(analyzed_text, images)
-                analysis["reason"] = f"Gemini unavailable; Azure frame fallback used. {analysis['reason']}"
-        else:
-            analysis = await moderator.analyze(analyzed_text, images)
-        if audio_failed:
-            analysis["reason"] = f"Audio transcription incomplete; visual/text result only. {analysis['reason']}"
+                method = video_moderator.analyze if media_kind == 'video' else video_moderator.analyze_audio
+                analysis = await method(data, speech, text)
+            except Exception:
+                try:
+                    if media_kind == 'video':
+                        frames = await asyncio.to_thread(moderator._video_frames, data)
+                        analysis = await analyze_image_fallback(moderator, frames, analyzed_text)
+                    elif speech:
+                        analysis = await moderator.analyze(f'{text}\nTranscript: {speech}')
+                    else:
+                        raise ValueError('No readable audio or transcript')
+                    analysis = require_review(analysis, 'Native media analysis unavailable; only sampled frames or a partial transcript were assessed.', retry=True)
+                except Exception:
+                    problems.append(f'A {media_kind} attachment could not be assessed.')
+                    continue
+            if speech_failed:
+                analysis['coverage'] = (analysis.get('coverage', '') +
+                                        ' Separate speech transcription unavailable; native audio was used.').strip()
+            results.append(analysis)
+        if images:
+            try:
+                analysis = await video_moderator.analyze_images(images, analyzed_text)
+            except Exception:
+                try:
+                    analysis = await analyze_image_fallback(moderator, images, analyzed_text)
+                    analysis['reason'] = f"Azure image fallback used. {analysis['reason']}"
+                except Exception:
+                    problems.append('Images could not be assessed.')
+                    analysis = None
+            if analysis:
+                results.append(analysis)
+        if not media:
+            if kind in {'image', 'video', 'audio'}:
+                problems.append('The media content was not supplied by Instagram; only its caption is available.')
+            calls = [moderator.analyze(text)]
+            if os.environ.get('MODERATION_TEXT_SECOND_OPINION', 'true').lower() != 'false' and video_moderator is not None:
+                calls.append(video_moderator.analyze_text(text))
+            assessments = await asyncio.gather(*calls, return_exceptions=True)
+            valid = [r for r in assessments if isinstance(r, dict)]
+            analysis = combine_results(valid, second_opinion=True)
+            if len(valid) != len(assessments):
+                analysis = require_review(analysis, 'One text assessment failed; the independent check is incomplete.', retry=True)
+            results.append(analysis)
+        analysis = combine_results(results)
+        for problem in problems:
+            analysis = require_review(analysis, problem, retry=True)
+        if analysis.get('retry_required'):
+            SCAN_ERRORS.append('Some content was only partially assessed and will be retried. See Needs review.')
         text = f"{text}\nTranscript: {transcript}" if transcript else text
     except Exception as error:
-        failed = True
-        analysis = {"bullying": False, "severity": "unknown", "confidence": 0, "error": True,
-                    "reason": f"Analysis unavailable: {type(error).__name__}", "categories": []}
+        analysis = {"bullying": False, "severity": "unknown", "confidence": 0,
+                    "reason": f"Analysis failed: {type(error).__name__}", "categories": [],
+                    "status": "unavailable", "needs_review": True}
         print(f"AI analysis failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-    record_event(kind, source, text, analysis, sender)
-    outcome = "unavailable" if failed else "BULLYING" if analysis["bullying"] else "safe"
-    print(f"AI {outcome}: {source} ({analysis['severity']})", flush=True)
-    return not failed
+        SCAN_ERRORS.append('AI analysis failed. Check Azure/Sarvam/Gemini configuration.')
+    record_event(kind, source, text, analysis, event_id, previews, original_text, sender)
+    label = analysis.get('status', 'unavailable')
+    print(f"AI {label}: {source} ({analysis['severity']})", flush=True)
+    return analysis["severity"] != "unknown" and not analysis.get('retry_required', False) and not preview_failed
 
 
-async def retry_failed_events():
-    """Reclassify historical failures after provider configuration is repaired."""
-    global EVENT_FILE
-    load_dotenv()
-    username = os.environ.get("IG_USERNAME")
-    if not username:
-        raise SystemExit("Set IG_USERNAME in .env")
-    _, _, EVENT_FILE = account_files(username)
-    if not EVENT_FILE.exists():
-        print("No events to retry")
-        return
-    events = [json.loads(line) for line in EVENT_FILE.read_text(encoding="utf-8").splitlines() if line.strip()]
-    moderator = AzureModerator()
-    repaired = 0
-    try:
-        for event in events:
-            previous = event.get("analysis") or {}
-            guarded = enforce_explicit_abuse(previous, event.get("text", ""))
-            if guarded != previous:
-                event["analysis"] = guarded
-                repaired += 1
-                continue
-            if not previous.get("error") and not str(previous.get("reason", "")).startswith("Analysis failed:"):
-                continue
-            analysis = await moderator.analyze(event.get("text", ""))
-            if event.get("kind") in {"image", "video", "audio"}:
-                analysis["reason"] = f"Text-only recovery; original media was not retained. {analysis['reason']}"
-            event["analysis"] = analysis
-            repaired += 1
-    finally:
-        await moderator.http.aclose()
-    temporary = EVENT_FILE.with_suffix(".tmp")
-    temporary.write_text("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events), encoding="utf-8")
-    temporary.replace(EVENT_FILE)
-    print(f"Reanalyzed {repaired} failed events")
+async def analyze_image_fallback(moderator, images, text):
+    return combine_results([await moderator.analyze(text, images[i:i + 6]) for i in range(0, len(images), 6)])
 
 
 async def main():
-    global SESSION_FILE, SEEN_FILE, EVENT_FILE
+    global SESSION_FILE, SEEN_FILE, EVENT_FILE, STATUS_FILE
     load_dotenv()
-    username = os.environ.get("IG_USERNAME")
-    password = os.environ.get("IG_PASSWORD")
-    if not username or not password:
-        raise SystemExit("Set IG_USERNAME and IG_PASSWORD in .env")
-
-    SESSION_FILE, SEEN_FILE, EVENT_FILE = account_files(username)
-    profiles = SenderProfiles(EVENT_FILE.with_name(EVENT_FILE.name.replace("-events.jsonl", "-profiles.json")))
-    interval = int(os.environ.get("IG_POLL_SECONDS", "60"))
-    client = MonitorClient()
-    client.delay_range = [1, 3]
-    if SESSION_FILE.exists():
-        client.load_settings(SESSION_FILE, override_app_version=True)
-    await client.login(username, password)
-    client.dump_settings(SESSION_FILE)
+    token_file = os.environ.get("IG_TOKEN_FILE")
+    if not token_file or not Path(token_file).exists():
+        raise SystemExit("Connect Instagram first; IG_TOKEN_FILE is missing")
+    token_data = json.loads(Path(token_file).read_text(encoding="utf-8"))
+    client = InstagramGraph(token_data["access_token"], token_data["user_id"])
+    await client.refresh_if_needed(token_data, Path(token_file))
+    profile = await client.profile()
+    username = profile["username"]
+    token_data['username'] = username
+    write_json(Path(token_file), token_data)
+    SEEN_FILE = account_path(token_data['user_id'], 'seen.json')
+    EVENT_FILE = account_path(token_data['user_id'], 'events.jsonl')
+    STATUS_FILE = account_path(token_data['user_id'], 'status.json')
+    inbox = account_path(token_data['user_id'], 'inbox')
+    profiles = SenderProfiles(account_path(token_data['user_id'], 'profiles.json'))
+    interval = max(30, int(os.environ.get("IG_POLL_SECONDS", "60")))
 
     moderator = AzureModerator()
     transcriber = SarvamTranscriber(moderator.http)
     video_moderator = GeminiVideoModerator(moderator.http)
-    # The authenticated session already contains this ID; avoiding a redundant
-    # username lookup reduces private-API requests and checkpoint risk.
-    user_id = client.user_id or await client.user_id_from_username(username)
+    preview_store = PreviewStore()
     seen = set(json.loads(SEEN_FILE.read_text())) if SEEN_FILE.exists() else set()
-    dm_baselined = any(item.startswith("dm:") for item in seen)
-    print(f"Monitoring @{username}'s comments, DMs, and media every {interval} seconds. Press Ctrl+C to stop.")
+    print(f"Monitoring @{username}'s comments and media every {interval} seconds. Press Ctrl+C to stop.")
 
     while True:
+        SCAN_ERRORS.clear()
+        write_json(STATUS_FILE, {'state': 'scanning', 'username': username,
+                                'updated_at': datetime.now(timezone.utc).isoformat()})
         try:
-            for media in await client.user_medias(user_id, amount=3):
-                media_id = f"media:{media.id}"
+            await client.refresh_if_needed(token_data, Path(token_file))
+            for pending in sorted(inbox.glob('*.json')):
+                item = json.loads(pending.read_text(encoding='utf-8'))
+                if item['id'] not in seen:
+                    if item['id'].startswith('dm:'):
+                        sender_id = (item.get('sender') or {}).get('id') or (item['source'] if item['source'].isdigit() else None)
+                        if sender_id:
+                            item['sender'] = await profiles.resolve(client, sender_id)
+                            item['source'] = sender_label(item['sender'])
+                    if await moderate(moderator, transcriber, video_moderator, item['kind'], item['source'],
+                                      item['text'], item['media'], item['id'], preview_store, token_data['user_id'], sender=item.get('sender')):
+                        seen.add(item['id'])
+                if item['id'] in seen:
+                    write_json(SEEN_FILE, sorted(seen))
+                    pending.unlink()
+            for media in await client.media(100):
+                media_id = f"media:{media['id']}"
                 if media_id not in seen:
-                    assets = media_urls(media)
-                    kind = "video" if any(media_kind == "video" for _, media_kind in assets) else "image"
-                    await moderate(moderator, transcriber, video_moderator, kind, f"post {media.code}", media.caption_text or "Post media", assets)
-                    seen.add(media_id)
-                comments = await client.media_comments(media.id, amount=100)
-                new_ids = unseen_ids([str(comment.pk) for comment in comments], seen)
+                    parts = await client.children(media['id']) if media.get('media_type') == 'CAROUSEL_ALBUM' else [media]
+                    assets = [(p['media_url'], 'video' if p.get('media_type') == 'VIDEO' else 'image')
+                              for p in parts if p.get('media_url')]
+                    kind = 'video' if any(k == 'video' for _, k in assets) else 'image'
+                    analyzed = await moderate(moderator, transcriber, video_moderator, kind, f"post {media['id']}", media.get("caption", "Post media"), assets, media_id, preview_store, token_data['user_id'])
+                    if analyzed:
+                        seen.add(media_id)
+                comments = await client.comments(media["id"], 100)
+                if media.get('comments_count', 0) and not comments:
+                    SCAN_ERRORS.append(f"Instagram reports {media['comments_count']} comments on post {media['id']}, but returned no comment records. Access or visibility needs checking in Meta.")
+                replies = []
                 for comment in comments:
-                    if str(comment.pk) in new_ids:
-                        print(f"NEW [{media.code}] @{comment.user.username}: {comment.text}", flush=True)
-                        await moderate(moderator, transcriber, video_moderator, "comment", f"@{comment.user.username} · post {media.code}", comment.text)
-                seen.update(new_ids)
-            threads = await client.direct_threads(amount=20, thread_message_limit=20)
-            threads += await client.direct_pending_inbox(amount=20)
-            for thread in threads:
-                for participant in [*thread.users, *getattr(thread, "left_users", [])]:
-                    profiles.remember(participant)
-            for thread in threads:
-                for message in thread.messages:
-                    message_id = f"dm:{message.id}"
-                    if dm_baselined and message_id not in seen and not message.is_sent_by_viewer:
-                        sender = await profiles.resolve(client, message.user_id)
-                        label = sender_label(sender)
-                        if message.text:
-                            print(f"NEW DM {label}: {message.text}", flush=True)
-                            await moderate(moderator, transcriber, video_moderator, "dm", label, message.text, sender=sender)
-                        url, kind = message_media(message)
-                        if url:
-                            print(f"NEW DM {kind} {label}", flush=True)
-                            await moderate(moderator, transcriber, video_moderator, kind, f"{label} · direct message", f"Incoming {kind}", [(url, kind)], sender=sender)
-                    seen.add(message_id)
-            if not dm_baselined:
-                dm_baselined = True
-                print("Existing DMs baselined; new incoming messages will now be analyzed.", flush=True)
+                    replies.extend(await client.replies(comment['id']))
+                comments.extend(replies)
+                for comment in comments:
+                    comment_id = 'comment:'+str(comment['id'])
+                    if comment_id not in seen:
+                        author = comment.get("username") or (comment.get("from") or {}).get("username") or "unknown"
+                        print(f"NEW [post {media['id']}] @{author}: {comment.get('text', '')}", flush=True)
+                        analyzed = await moderate(moderator, transcriber, video_moderator, "comment", f"@{author} · post {media['id']}", comment.get("text", ""), event_id=comment_id, preview_store=preview_store, account_id=token_data['user_id'])
+                        if analyzed:
+                            seen.add(comment_id)
             # ponytail: unbounded test-account history; prune when this file becomes materially large.
-            SEEN_FILE.write_text(json.dumps(sorted(seen)), encoding="utf-8")
-        except (ChallengeRequired, LoginRequired) as error:
-            print(f"Instagram session blocked: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-            raise
+            write_json(SEEN_FILE, sorted(seen))
         except Exception as error:
-            print(f"Scan failed: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            SCAN_ERRORS.append(f'Scan failed: {type(error).__name__}. Check monitor log; reconnect if the token expired.')
+        write_json(STATUS_FILE, {'state': 'error' if SCAN_ERRORS else 'healthy', 'username': username,
+                                'errors': list(dict.fromkeys(SCAN_ERRORS)),
+                                'updated_at': datetime.now(timezone.utc).isoformat()})
+        if '--once' in sys.argv:
+            await client.close()
+            await moderator.http.aclose()
+            preview_store.close()
+            return
         await asyncio.sleep(interval)
 
 
@@ -288,22 +248,11 @@ if __name__ == "__main__":
         assert unseen_ids(["1", "2"], {"1"}) == ["2"]
         assert account_files("Example.User")[0] == account_files("example.user")[0]
         print("Self-test passed")
-    elif "--retry-failures" in sys.argv:
-        asyncio.run(retry_failed_events())
     elif "--login-test" in sys.argv:
         async def login_test():
             global SESSION_FILE, SEEN_FILE, EVENT_FILE
             load_dotenv()
-            username, password = os.environ.get("IG_USERNAME"), os.environ.get("IG_PASSWORD")
-            if not username or not password:
-                raise SystemExit("Missing Instagram credentials")
-            SESSION_FILE, SEEN_FILE, EVENT_FILE = account_files(username)
-            client = MonitorClient()
-            if SESSION_FILE.exists():
-                client.load_settings(SESSION_FILE, override_app_version=True)
-            await client.login(username, password)
-            client.dump_settings(SESSION_FILE)
-            print("Login verified")
+            raise SystemExit("Password login was removed; use the Instagram OAuth flow")
         asyncio.run(login_test())
     else:
         try:
