@@ -70,6 +70,29 @@ Start-Setup
 """)
         self.assertIn('No packages or settings were changed', output)
 
+    def test_student_test_rejects_normal_dashboard_instead_of_closing_silently(self):
+        output = self.run_script("""
+$StudentTest=$true
+function Test-DashboardRunning { return $true }
+function Test-StudentTestEnabled { return $false }
+try { Start-Setup; throw 'Should have failed' }
+catch {
+    if ($_.Exception.Message -notlike '*already running without IP sharing*') { throw }
+    Write-Host 'VISIBLE_STUDENT_TEST_ERROR'
+}
+""")
+        self.assertIn('VISIBLE_STUDENT_TEST_ERROR', output)
+
+    def test_student_test_recognizes_existing_collector(self):
+        output = self.run_script("""
+$StudentTest=$true
+function Test-DashboardRunning { return $true }
+function Test-StudentTestEnabled { return $true }
+function Invoke-Checked { throw 'Must not execute' }
+Start-Setup
+""")
+        self.assertIn('IP sharing is already running', output)
+
     def test_fresh_install_sequences_tools_environment_form_then_launch(self):
         with tempfile.TemporaryDirectory(prefix='setup test ') as directory:
             folder = directory.replace("'", "''")

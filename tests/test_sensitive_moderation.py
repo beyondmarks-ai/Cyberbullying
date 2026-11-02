@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'examples'))
 import comment_monitor as monitor
-from azure_moderation import combine_results, normalize, require_review, segment_ranges, GeminiVideoModerator, azure_schema, RESULT_SCHEMA
+from azure_moderation import (RESULT_SCHEMA, GeminiVideoModerator, azure_schema, combine_results,
+                              multilingual_guardrail, normalize, require_review, segment_ranges)
 
 
 def assessment(bullying=False, **changes):
@@ -18,6 +19,38 @@ def assessment(bullying=False, **changes):
 
 
 class SensitiveTests(unittest.IsolatedAsyncioTestCase):
+    def test_multilingual_guardrail_native_romanized_and_mixed_abuse(self):
+        cases = {
+            'Hindi': 'तू बेकार है। कोई तुझे अपने साथ नहीं चाहता।',
+            'Hinglish': 'Tu bilkul bekaar hai, group se nikal ja.',
+            'Kannada': 'ನೀನು ಮೂರ್ಖ, ಯಾರಿಗೂ ನೀನು ಇಷ್ಟವಿಲ್ಲ.',
+            'Kannada-English': 'ನೀನು totally useless.',
+            'Kanglish': 'Neenu moorkha, groupinda horage hogu.',
+            'Tamil': 'நீ ஒரு முட்டாள். குழுவை விட்டு வெளியே போ.',
+            'Tanglish': 'Nee oru muttal, groupai vittu veliye po.',
+            'Telugu': 'నువ్వు మూర్ఖుడివి. ఎవరూ నిన్ను ఇష్టపడరు.',
+            'Tenglish': 'Nuvvu waste, group nundi bayataku po.',
+            'Spanish': 'Eres inútil. Nadie te quiere.',
+            'Arabic': 'أنت عديم الفائدة، لا أحد يريدك.',
+            'Obfuscated English': 'y0u are w0rthless; n0body wants y0u.',
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                result = multilingual_guardrail(text)
+                self.assertIsNotNone(result)
+                self.assertTrue(result['bullying'])
+                self.assertEqual(result['status'], 'bullying')
+
+    def test_multilingual_guardrail_avoids_benign_and_reporting_text(self):
+        for text in (
+            'ನಿಮ್ಮ ಕೆಲಸ ತುಂಬಾ ಚೆನ್ನಾಗಿದೆ, ಅಭಿನಂದನೆಗಳು!',
+            'நன்றி, இன்று நன்றாக செய்தாய்.',
+            'Someone called me "worthless". Please help me report the bullying.',
+            'Do not call people stupid.',
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(multilingual_guardrail(text))
+
     def test_azure_schema_is_strict_and_complete(self):
         schema = azure_schema(RESULT_SCHEMA)
         self.assertFalse(schema['additionalProperties'])

@@ -78,6 +78,15 @@ function Test-DashboardRunning {
     finally { $client.Dispose() }
 }
 
+function Test-StudentTestEnabled {
+    try {
+        $status = Invoke-RestMethod -Uri 'http://127.0.0.1:8765/api/student-test' -TimeoutSec 2
+        return $status.enabled -eq $true
+    } catch {
+        return $false
+    }
+}
+
 function Test-LocalConfiguration([string]$Python, [string]$ConfigTool) {
     $previousPreference = $ErrorActionPreference
     try {
@@ -92,6 +101,13 @@ function Start-Setup {
     Write-Host 'Instagram Safety Monitor - Windows setup and launch'
     Write-Host 'First run needs internet. Missing tools are installed through winget; cloud accounts and keys are not created.'
     if (-not $CheckOnly -and (Test-DashboardRunning)) {
+        if ($StudentTest) {
+            if (Test-StudentTestEnabled) {
+                Write-Host 'IP sharing is already running. Open http://127.0.0.1:8765 and expand IP sharing settings.'
+                return
+            }
+            throw 'A dashboard is already running without IP sharing. Close its launcher with Ctrl+C, then run start-student-test.cmd again.'
+        }
         Write-Host 'Port 8765 is already in use. No packages or settings were changed.'
         Write-Host 'If this is your dashboard, open http://127.0.0.1:8765. To update/configure it, stop its launcher first.'
         return

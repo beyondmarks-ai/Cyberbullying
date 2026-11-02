@@ -73,22 +73,30 @@ const cases = [
     },
   },
   { ...base, analysis: { bullying: false, severity: 'unknown', reason: 'Failed' } },
+  {
+    ...base,
+    analysis: { bullying: true, needs_review: true, severity: 'high', reason: 'Threat needs confirmation' },
+  },
 ];
 context.fixture = cases;
 vm.runInContext('events = fixture; render()', context);
-assert.equal(elements.get('#alerts').textContent, 3);
+assert.equal(elements.get('#alerts').textContent, 4);
 const rows = elements.get('#events').children;
-assert.equal(rows.length, 4);
+assert.equal(rows.length, 5);
+assert.match(rows[0].className, /clear/);
+assert.match(text(rows[0]), /Clear/);
 assert.match(rows[1].className, /alert/);
 assert.match(rows[2].className, /review/);
 assert.match(text(rows[2]), /Needs human review/);
 assert.match(text(rows[2]), /<img src=x onerror=alert\(1\)>/);
 assert.match(text(rows[2]), /58-90s: review/);
 assert.match(text(rows[3]), /Analysis unavailable/);
+assert.match(rows[4].className, /alert review/);
+assert.match(text(rows[4]), /Bullying · Review/);
 vm.runInContext("filter = 'review'; render()", context);
-assert.equal(elements.get('#events').children.length, 2);
-vm.runInContext("filter = 'alert'; render()", context);
 assert.equal(elements.get('#events').children.length, 3);
+vm.runInContext("filter = 'alert'; render()", context);
+assert.equal(elements.get('#events').children.length, 4);
 console.log('PASS: review/alert filters, legacy results, unavailable state, segment evidence, safe text rendering');
 
 context.fixture = [

@@ -16,6 +16,8 @@
         --green: #22c55e;
         --blue: #38bdf8;
         --red: #f87171;
+        --amber: #fbbf24;
+        --purple: #c084fc;
       }
       * {
         box-sizing: border-box;
@@ -344,6 +346,10 @@
         border: 2px solid var(--red);
         background: #351b27;
       }
+      .event.clear {
+        border-color: var(--green);
+        background: #122b26;
+      }
       .badge {
         display: inline-flex;
         align-items: center;
@@ -376,6 +382,10 @@
         color: #450a0a;
         background: var(--red);
       }
+      .badge.clear {
+        color: #052e16;
+        background: var(--green);
+      }
       .message {
         overflow-wrap: anywhere;
         white-space: pre-wrap;
@@ -389,14 +399,26 @@
         color: #fecaca;
       }
       .event.review {
-        border-color: #fbbf24;
+        border: 2px solid var(--amber);
+        background: #332815;
       }
       .badge.review {
         color: #422006;
-        background: #fbbf24;
+        background: var(--amber);
       }
       .review .analysis {
         color: #fde68a;
+      }
+      .event.alert.review {
+        border-color: var(--purple);
+        background: #301d3c;
+      }
+      .badge.alert-review {
+        color: #2e1065;
+        background: var(--purple);
+      }
+      .alert.review .analysis {
+        color: #e9d5ff;
       }
       time,
       .empty {
@@ -958,16 +980,34 @@
             source = document.createElement('strong'),
             message = document.createElement('div'),
             time = document.createElement('time');
-          row.className = `card event${review ? ' review' : flagged ? ' alert' : ''}`;
-          badge.className = `badge ${review ? 'review' : flagged ? 'alert' : event.kind}`;
+          const assessedClear = event.analysis && !flagged && !review;
+          row.className = `card event${flagged ? ' alert' : ''}${review ? ' review' : ''}${
+            assessedClear ? ' clear' : ''
+          }`;
+          badge.className = `badge ${
+            flagged && review
+              ? 'alert-review'
+              : flagged
+              ? 'alert'
+              : review
+              ? 'review'
+              : assessedClear
+              ? 'clear'
+              : event.kind
+          }`;
           const badgeLabel = document.createElement('span');
-          badgeLabel.textContent = review
-            ? 'Needs review'
-            : flagged
-            ? 'Potential bullying'
-            : event.kind === 'dm'
-            ? 'Message'
-            : event.kind[0].toUpperCase() + event.kind.slice(1);
+          badgeLabel.textContent =
+            flagged && review
+              ? 'Bullying · Review'
+              : flagged
+              ? 'Potential bullying'
+              : review
+              ? 'Needs review'
+              : assessedClear
+              ? 'Clear'
+              : event.kind === 'dm'
+              ? 'Message'
+              : event.kind[0].toUpperCase() + event.kind.slice(1);
           badge.append(activityIcon(event.kind), badgeLabel);
           source.textContent =
             event.source +

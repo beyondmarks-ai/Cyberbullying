@@ -229,7 +229,8 @@ def preview_action(headers, account, path, method='GET'):
         return {'error': 'Open previews from the local dashboard.'}, 403
     if not account.get('user_id'):
         return {'error': 'Connect Instagram first.'}, 401
-    preview_id = path.removeprefix('/api/previews/')
+    prefix = '/api/previews/'
+    preview_id = path[len(prefix):] if path.startswith(prefix) else path
     if not re.fullmatch(r'[a-f0-9]{64}', preview_id):
         return {'error': 'Preview not found.'}, 404
     store = None

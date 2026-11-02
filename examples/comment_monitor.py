@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from azure_moderation import (AzureModerator, GeminiVideoModerator, SarvamTranscriber,
-                              combine_results, require_review)
+                              combine_results, multilingual_guardrail, require_review, run_in_thread)
 from instagram_graph import InstagramGraph
 from instagram_store import account_path, write_json, ROOT
 from preview_storage import PreviewStore
@@ -64,7 +64,7 @@ async def moderate(moderator, transcriber, video_moderator, kind, source, text, 
                 continue
             if preview_store is not None:
                 try:
-                    previews.append(await asyncio.to_thread(preview_store.capture, account_id, event_id, index, media_kind, data))
+                    previews.append(await run_in_thread(preview_store.capture, account_id, event_id, index, media_kind, data))
                 except (ValueError, OSError):
                     previews.append({'kind': media_kind, 'state': 'unsupported'})
                 except Exception as error:
@@ -89,6 +89,9 @@ async def moderate(moderator, transcriber, video_moderator, kind, source, text, 
         transcript = " ".join(transcripts)
         analyzed_text = f"{text}\nSpoken transcript: {transcript}" if transcript else text
         results = []
+        guardrail = multilingual_guardrail(analyzed_text)
+        if guardrail:
+            results.append(guardrail)
         for media_kind, data, speech, speech_failed in timed:
             try:
                 method = video_moderator.analyze if media_kind == 'video' else video_moderator.analyze_audio
@@ -96,7 +99,7 @@ async def moderate(moderator, transcriber, video_moderator, kind, source, text, 
             except Exception:
                 try:
                     if media_kind == 'video':
-                        frames = await asyncio.to_thread(moderator._video_frames, data)
+                        frames = await run_in_thread(moderator._video_frames, data)
                         analysis = await analyze_image_fallback(moderator, frames, analyzed_text)
                     elif speech:
                         analysis = await moderator.analyze(f'{text}\nTranscript: {speech}')

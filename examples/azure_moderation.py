@@ -1,12 +1,15 @@
 import asyncio
 import base64
+import functools
 import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 from pathlib import Path
 
 import httpx
@@ -92,6 +95,12 @@ between audio and visuals. Distinguish bullying from friendly teasing, neutral c
 education, or counterspeech. Return the same JSON fields defined by the safety classifier."""
 
 
+async def run_in_thread(function, *args, **kwargs):
+    """Python 3.8-compatible equivalent of asyncio.to_thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
+
+
 def normalize(result):
     if not isinstance(result, dict) or not isinstance(result.get('bullying'), bool):
         raise ValueError('The classifier returned no valid bullying decision')
@@ -130,6 +139,78 @@ def clean_list(value):
     return [str(item)[:400] for item in value[:12]] if isinstance(value, list) else []
 
 
+# High-precision phrases provide a deterministic fallback for common targeted abuse.
+# They supplement the semantic model; they are deliberately not a general banned-word list.
+MULTILINGUAL_ABUSE_RULES = (
+    ('English', 'targeted insult', 'medium', r'\b(?:y[o0]u|u)\s+(?:are|r)\s+(?:a\s+)?(?:w[o0]rthless|useless|stupid|ugly|loser)\b'),
+    ('English', 'targeted exclusion', 'medium', r'\b(?:n[o0]body|no\s+one)\s+(?:wants|likes)\s+(?:y[o0]u|u)\b'),
+    ('English', 'self-harm encouragement', 'high', r'\b(?:kill|hurt)\s+yourself\b|\bkys\b'),
+    ('Hindi', 'targeted insult', 'medium', r'(?:तू|तुम)\s+(?:बिल्कुल\s+)?(?:बेकार|निकम्म[ाी]|बेवकूफ|मूर्ख|चूतिया)\s*(?:है|हो)?'),
+    ('Hindi', 'targeted exclusion', 'medium', r'कोई\s+तुझे\s+(?:अपने\s+साथ\s+)?नहीं\s+चाहता'),
+    ('Hindi', 'sexualized family abuse', 'high', r'तेरी\s+माँ\s+की\s+(?:चूत|गांड)'),
+    ('Hinglish', 'targeted insult', 'medium', r'\b(?:tu|tum)\s+(?:bilkul\s+)?(?:bekaar|bekar|nikamm[ai]|bewakoof|chutiya)\s+(?:hai|ho)\b'),
+    ('Hinglish', 'targeted insult', 'medium', r'\b(?:tu|tum)\s+(?:bilkul\s+)?(?:बेकार|निकम्म[ाी]|बेवकूफ|चूतिया)\s+(?:hai|ho)\b'),
+    ('Hinglish', 'targeted exclusion', 'medium', r'\b(?:group\s+se\s+nikal\s+ja|koi\s+tujhe\s+nahi\s+chahta)\b'),
+    ('Kannada', 'targeted insult', 'medium', r'ನೀನು\s+(?:ಒಬ್ಬ\s+)?(?:ಮೂರ್ಖ|ನಿಷ್ಪ್ರಯೋಜಕ|ಕೆಟ್ಟವನು|ಕೆಟ್ಟವಳು)'),
+    ('Kannada-English', 'targeted insult', 'medium', r'ನೀನು\s+(?:totally\s+)?(?:useless|stupid|worthless|loser)\b'),
+    ('Kannada', 'targeted exclusion', 'medium', r'(?:ಯಾರಿಗೂ\s+ನೀನು\s+ಇಷ್ಟವಿಲ್ಲ|ನಿನ್ನನ್ನು\s+ಯಾರೂ\s+ಇಷ್ಟಪಡುವುದಿಲ್ಲ|ಗುಂಪಿನಿಂದ\s+ಹೊರಗೆ\s+ಹೋಗು)'),
+    ('Kanglish', 'targeted insult', 'medium', r'\b(?:neenu|ninu)\s+(?:tumba\s+)?(?:moorkha|useless|waste)\b'),
+    ('Kanglish', 'targeted exclusion', 'medium', r'\b(?:yaarigu\s+neenu\s+ishta(?:villa|valla)|group(?:ninda|inda)\s+horage\s+hog[uo])\b'),
+    ('Tamil', 'targeted insult', 'medium', r'நீ\s+(?:ஒரு\s+)?(?:முட்டாள்|பயனற்றவன்|பயனற்றவள்)'),
+    ('Tamil', 'targeted exclusion', 'medium', r'(?:யாருக்கும்\s+உன்னை\s+பிடிக்காது|குழுவை\s+விட்டு\s+வெளியே\s+போ)'),
+    ('Tanglish', 'targeted insult', 'medium', r'\bnee\s+(?:oru\s+)?(?:muttal|loosu|waste|useless)\b'),
+    ('Tanglish', 'targeted exclusion', 'medium', r'\b(?:yaarukkum\s+unnai\s+pidikkaathu|group(?:ai)?\s+vittu\s+veliye\s+po)\b'),
+    ('Telugu', 'targeted insult', 'medium', r'నువ్వు\s+(?:ఒక\s+)?(?:మూర్ఖుడివి|మూర్ఖురాలివి|పనికిరానివాడివి|పనికిరానిదానివి)'),
+    ('Telugu', 'targeted exclusion', 'medium', r'(?:ఎవరూ\s+నిన్ను\s+ఇష్టపడరు|గుంపు\s+నుండి\s+బయటకు\s+పో)'),
+    ('Tenglish', 'targeted insult', 'medium', r'\bnuvvu\s+(?:oka\s+)?(?:moorkhudivi|panikirani|waste|useless)\b'),
+    ('Tenglish', 'targeted exclusion', 'medium', r'\b(?:evaru\s+ninnu\s+ishtapadaru|group\s+nundi\s+bayataku\s+po)\b'),
+    ('Spanish', 'targeted insult', 'medium', r'\beres\s+(?:un\s+|una\s+)?(?:inútil|idiota|estúpid[oa])\b'),
+    ('Spanish', 'targeted exclusion', 'medium', r'\bnadie\s+te\s+(?:quiere|soporta)\b'),
+    ('Arabic', 'targeted insult', 'medium', r'أنت\s+(?:عديم\s+الفائدة|غبي|أحمق)'),
+    ('Arabic', 'targeted exclusion', 'medium', r'لا\s+أحد\s+(?:يريدك|يحبك)'),
+)
+
+REPORTING_OR_COUNTERSPEECH = re.compile(
+    r'\b(?:someone|they|he|she)\s+(?:called|said|wrote|sent)|\b(?:report|reported|reporting|quote|quoted)\b|'
+    r'\b(?:do not|don\'t|never)\s+(?:say|call|tell)|'
+    r'(?:मुझे|उसने).{0,24}(?:कहा|बोला)|(?:என்னை|அவர்).{0,24}(?:சொன்னார்|அழைத்தார்)|'
+    r'(?:ನನಗೆ|ಅವನು|ಅವಳು).{0,24}(?:ಹೇಳಿದ|ಕರೆದ)|(?:నన్ను|అతను|ఆమె).{0,24}(?:అన్నాడు|పిలిచాడు)|'
+    r'\b(?:me\s+(?:dijo|llamó)|denunciar|reportar)\b|(?:قال|أبلغ|اقتباس)',
+    re.IGNORECASE,
+)
+
+
+def multilingual_guardrail(text):
+    """Return a high-confidence abusive finding, or None when no safe rule matches."""
+    prepared = unicodedata.normalize('NFKC', str(text or ''))
+    prepared = re.sub(r'[\u200b-\u200f\u2060\ufeff]', '', prepared).casefold()
+    if not prepared or REPORTING_OR_COUNTERSPEECH.search(prepared):
+        return None
+    matches = []
+    for language, category, severity, pattern in MULTILINGUAL_ABUSE_RULES:
+        match = re.search(pattern, prepared, re.IGNORECASE)
+        if match:
+            matches.append((language, category, severity, match.group(0)))
+    if not matches:
+        return None
+    severity = max((item[2] for item in matches), key={'low': 1, 'medium': 2, 'high': 3}.get)
+    languages = list(dict.fromkeys(item[0] for item in matches))
+    categories = list(dict.fromkeys(item[1] for item in matches))
+    evidence = list(dict.fromkeys(item[3] for item in matches))[:5]
+    return normalize({
+        'bullying': True,
+        'confidence': .97,
+        'severity': severity,
+        'reason': 'A targeted abusive or exclusionary phrase was detected by the multilingual safety guardrail.',
+        'categories': categories,
+        'content_summary': 'The message contains a targeted abusive or exclusionary statement.',
+        'needs_review': False,
+        'languages': languages,
+        'evidence': evidence,
+        'uncertainties': [],
+    })
+
+
 def require_review(result, reason, retry=False):
     result = dict(result)
     result.update(needs_review=True, status='review')
@@ -159,7 +240,7 @@ def combine_results(results, second_opinion=False):
         combined['segments'] = segments
     if second_opinion and len({r['bullying'] for r in results}) > 1:
         combined = require_review(combined, 'Independent assessments disagree; a person should review the evidence.')
-    combined['analysis_version'] = 'sensitive-v1'
+    combined['analysis_version'] = 'sensitive-v2'
     return combined
 
 
@@ -210,13 +291,16 @@ class AzureModerator:
             json={"messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": content}],
                   "response_format": {"type": "json_schema", "json_schema": {
                       "name": "safety_assessment", "strict": True, "schema": azure_schema(RESULT_SCHEMA)}},
-                  "temperature": 0, "max_tokens": 1600},
+                  "max_completion_tokens": 1600},
         )
         response.raise_for_status()
         choice = response.json()["choices"][0]
         if choice.get('finish_reason', 'stop') != 'stop':
             raise ValueError('Azure returned incomplete or blocked analysis')
         result = validate_result(json.loads(choice["message"]["content"]))
+        guardrail = multilingual_guardrail(text)
+        if guardrail:
+            result = combine_results([result, guardrail])
         result['analyzer'] = f'Azure / {self.deployment}'
         return result
 
@@ -264,7 +348,7 @@ class SarvamTranscriber:
         if not self.key:
             raise RuntimeError("Set SARVAM_API_KEY in the environment")
         transcripts = []
-        for chunk in await asyncio.to_thread(self._audio_chunks, media):
+        for chunk in await run_in_thread(self._audio_chunks, media):
             response = await self.http.post(
                 "https://api.sarvam.ai/speech-to-text",
                 headers={"api-subscription-key": self.key},
@@ -299,7 +383,7 @@ class GeminiVideoModerator:
     def __init__(self, http):
         self.http = http
         self.provider = os.environ.get("GEMINI_API_PROVIDER", "gemini").strip().lower()
-        self.model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        self.model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
         self.key = os.environ.get("GEMINI_API_KEY", "").strip()
 
     def _credentials(self):
@@ -350,7 +434,7 @@ class GeminiVideoModerator:
         return await self._analyze_timed(audio, 'audio', context, transcript)
 
     async def _analyze_timed(self, media, kind, context, transcript):
-        chunks, duration, covered = await asyncio.to_thread(self._media_segments, media, kind)
+        chunks, duration, covered = await run_in_thread(self._media_segments, media, kind)
         results, failed, segments, last_error = [], False, [], None
         for chunk, start, end in chunks:
             prompt = VIDEO_PROMPT if kind == 'video' else (

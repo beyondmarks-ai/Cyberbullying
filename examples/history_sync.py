@@ -1,5 +1,6 @@
 """On-demand history import. No messages are sent and no historical AI calls are made."""
 import asyncio
+import functools
 import json
 import threading
 import time
@@ -16,6 +17,11 @@ from sender_profiles import SenderProfiles, sender_label
 MAX_CONVERSATIONS = 20
 MAX_PER_CONVERSATION = 50
 MAX_MESSAGES = 200
+
+
+async def run_in_thread(function, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(function, *args, **kwargs))
 
 
 def read_history(account_id):
@@ -120,7 +126,7 @@ async def download_attachment(http, url):
 async def backfill_previews(store, http, account_id, event_id, media, progress):
     previews = []
     for index, (kind, url) in enumerate(media):
-        existing = await asyncio.to_thread(store.find, account_id, event_id, index)
+        existing = await run_in_thread(store.find, account_id, event_id, index)
         if existing and existing['state'] != 'pending':
             previews.append(existing)
             progress['previews_available'] += existing['state'] == 'available'
@@ -133,7 +139,7 @@ async def backfill_previews(store, http, account_id, event_id, media, progress):
         else:
             try:
                 data = await download_attachment(http, url)
-                preview = await asyncio.to_thread(store.capture, account_id, event_id, index, kind, data)
+                preview = await run_in_thread(store.capture, account_id, event_id, index, kind, data)
                 progress['previews_available'] += preview['state'] == 'available'
             except httpx.HTTPStatusError as error:
                 preview = {'kind': kind, 'state': 'unavailable', 'message':
